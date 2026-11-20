@@ -5,7 +5,7 @@ import akshare as ak
 from .config import CONFIG_DIR
 
 def run():
-    df=ak.tool_trade_date_hist_sina(); dates=sorted({x.date() if hasattr(x,"date") else x for x in df["trade_date"]})
+    df=ak.calendar_trade_date_hist_sina(); dates=sorted({x.date() if hasattr(x,"date") else x for x in df["trade_date"]})
     today=date.today(); past=[d for d in dates if d<today][-10:]; future=[d for d in dates if d>=today]
     if len(future)<20: raise RuntimeError("future trading calendar is unexpectedly short")
     payload={"schema_version":1,"source":"akshare","akshare_version":ak.__version__,"updated_at":datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds"),"range_start":past[0].isoformat() if past else future[0].isoformat(),"range_end":future[-1].isoformat(),"trade_dates":[d.isoformat() for d in past+future]}
