@@ -1,7 +1,12 @@
-# Market Data Worker v0.1.0
+# Market Data Worker v0.2.0
 
-Initial deployable skeleton for OpenWrt Docker + GitHub Actions/GHCR.
+Implemented:
+- Sina 229-sector stable pagination, retries and per-request metrics
+- Minute-bucket timestamps and market phases
+- Local CSV, atomic status JSON and pending queue
+- Pending retry
+- Serv00 PostgreSQL schema
+- Flask ingest/latest Blueprint
+- AKShare calendar-update API rename
 
-Implemented: AKShare calendar update, Sina 229-sector collector, local CSV/pending/status, Serv00 batch POST hook, Parquet maintenance skeleton.
-
-Not yet wired: existing ETF/index repair logic, Serv00 ingest endpoint implementation, CrateDB upload/aggregation. These require the current ETF API files/schema and Serv00 endpoint details.
+All OpenWrt data is mounted from /mnt/ssd/moneyflow/data to /data and configuration from /mnt/ssd/moneyflow/config to /config.
