@@ -10,13 +10,13 @@ IMAGE="ghcr.io/aklimzzh/market-data-worker:latest"
 CONTAINER="market-maintenance"
 
 mkdir -p "$CONFIG_DIR" "$DATA_DIR/status" "$DATA_DIR/archive" "$LOG_DIR"
-
 TRADE_DATE="$(/usr/bin/python3 "$SCHEDULER" previous)"
 LOG_FILE="$LOG_DIR/maintenance_${TRADE_DATE}.log"
+EXTRA_ARGS=""
+[ "$(date '+%u')" = "6" ] && EXTRA_ARGS="--refresh-calendar"
 
 echo "==================================================" >> "$LOG_FILE"
-echo "$(date '+%Y-%m-%d %H:%M:%S') maintenance started date=$TRADE_DATE" >> "$LOG_FILE"
-
+echo "$(date '+%Y-%m-%d %H:%M:%S') maintenance started date=$TRADE_DATE args=$EXTRA_ARGS" >> "$LOG_FILE"
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
 docker run --rm \
@@ -25,7 +25,7 @@ docker run --rm \
   -v "$DATA_DIR:/data" \
   -v "$CONFIG_DIR:/config" \
   "$IMAGE" \
-  maintenance --date "$TRADE_DATE" --sleep 0.5 >> "$LOG_FILE" 2>&1
+  maintenance --date "$TRADE_DATE" --sleep 0.5 $EXTRA_ARGS >> "$LOG_FILE" 2>&1
 RC=$?
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') maintenance finished rc=$RC" >> "$LOG_FILE"

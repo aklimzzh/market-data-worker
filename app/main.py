@@ -9,17 +9,17 @@ from .maintenance import run as maintenance
 def main():
     parser = argparse.ArgumentParser(description="Market Data Worker")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("collector")
+    sub.add_parser("calendar-update")
 
-    sub.add_parser("collector", help="Run the real-time market collector")
-    sub.add_parser("calendar-update", help="Update the local trading calendar")
+    backfill = sub.add_parser("fundflow-backfill")
+    backfill.add_argument("--date", required=True)
+    backfill.add_argument("--sleep", type=float, default=0.5)
 
-    backfill_parser = sub.add_parser("fundflow-backfill")
-    backfill_parser.add_argument("--date", required=True)
-    backfill_parser.add_argument("--sleep", type=float, default=0.5)
-
-    maintenance_parser = sub.add_parser("maintenance")
-    maintenance_parser.add_argument("--date", required=True)
-    maintenance_parser.add_argument("--sleep", type=float, default=0.5)
+    maintain = sub.add_parser("maintenance")
+    maintain.add_argument("--date", required=True)
+    maintain.add_argument("--sleep", type=float, default=0.5)
+    maintain.add_argument("--refresh-calendar", action="store_true")
 
     args = parser.parse_args()
     if args.cmd == "collector":
@@ -29,7 +29,7 @@ def main():
     elif args.cmd == "fundflow-backfill":
         fundflow_backfill(args.date, args.sleep)
     elif args.cmd == "maintenance":
-        maintenance(args.date, args.sleep)
+        maintenance(args.date, args.sleep, args.refresh_calendar)
 
 
 if __name__ == "__main__":
