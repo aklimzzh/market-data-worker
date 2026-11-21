@@ -1,0 +1,11 @@
+Add this import to app/main.py:
+from .fundflow_backfill import run as fundflow_backfill
+
+Add this sub-command:
+b = sub.add_parser("fundflow-backfill")
+b.add_argument("--date", required=True)
+b.add_argument("--sleep", type=float, default=0.5)
+
+Add this dispatch branch before calendar-update/collector fallback:
+elif args.cmd == "fundflow-backfill":
+    fundflow_backfill(args.date, args.sleep)

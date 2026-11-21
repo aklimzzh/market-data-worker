@@ -1,12 +1,11 @@
-# Market Data Worker v0.2.0
+# Market Data Worker v0.3.0 add-on
 
-Implemented:
-- Sina 229-sector stable pagination, retries and per-request metrics
-- Minute-bucket timestamps and market phases
-- Local CSV, atomic status JSON and pending queue
-- Pending retry
-- Serv00 PostgreSQL schema
-- Flask ingest/latest Blueprint
-- AKShare calendar-update API rename
+Adds:
+- Sina per-sector full-day minute backfill
+- Zstandard Parquet archive
+- CrateDB 1m upload
+- CrateDB-generated 5m and daily tables
+- Idempotent 1m upserts
+- Row-count validation and status JSON
 
-All OpenWrt data is mounted from /mnt/ssd/moneyflow/data to /data and configuration from /mnt/ssd/moneyflow/config to /config.
+Copy files into the existing market-data-worker repository, apply main_patch.py.txt, rebuild the image, then run fundflow-backfill --date 2026-11-20.
