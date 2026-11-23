@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import time
 from datetime import datetime, time as dt_time
@@ -18,9 +20,11 @@ from .services.serv00 import post_batch
 from .sources.sina import fetch_snapshot
 
 TZ = ZoneInfo("Asia/Shanghai")
+FINAL_CHECK_TIMES = (dt_time(15, 35), dt_time(15, 40))
+FINAL_RETRY_DEADLINE = dt_time(15, 44)
 
 
-def phase(value):
+def phase(value: dt_time) -> str:
     if COLLECT_AUCTION and dt_time(9, 15) <= value < dt_time(9, 30):
         return "opening_auction_observe"
     if dt_time(9, 30) <= value <= dt_time(11, 30):
@@ -28,6 +32,10 @@ def phase(value):
     if dt_time(13, 0) <= value <= dt_time(15, 0):
         return "continuous_pm"
     if dt_time(15, 0) < value <= dt_time(15, 12):
+        return "closing_revision"
+    if dt_time(15, 35) <= value < dt_time(15, 36):
+        return "closing_revision"
+    if dt_time(15, 40) <= value < dt_time(15, 41):
         return "closing_revision"
     return "idle"
 
@@ -59,6 +67,10 @@ def normalize(rows, minute_ts, market_phase):
     return output
 
 
+def pending_count() -> int:
+    return len(list((DATA_DIR / "pending").glob("*.json")))
+
+
 def retry_pending():
     if not SERV00_INGEST_URL:
         return 0
@@ -76,37 +88,84 @@ def retry_pending():
     return sent
 
 
+def _is_final_check(bucket: datetime) -> bool:
+    return bucket.time() in FINAL_CHECK_TIMES
+
+
+def _status_base(final_checks: list[str]) -> dict:
+    return {
+        "final_checks": final_checks,
+        "pending_files": pending_count(),
+    }
+
+
 def run():
     session = requests.Session()
     last_bucket = None
     last_repair_check = 0.0
+    final_checks: list[str] = []
+    pending_flushed = 0
     status_path = DATA_DIR / "status" / "collector.json"
 
     while True:
         now = datetime.now(TZ)
-        if now.time() > dt_time(15, 12):
-            retry_pending()
-            write_json_atomic(status_path, {
-                "state": "STOPPED",
-                "stopped_at": now.isoformat(timespec="seconds"),
-                "reason": "market session completed",
-            })
-            return
+        current_time = now.time()
 
-        market_phase = phase(now.time())
+        # After the 15:40 final snapshot, keep retrying pending uploads until
+        # everything is delivered. 15:44 is the hard deadline; host safety-stop
+        # remains at 15:45.
+        if dt_time(15, 40) < current_time:
+            pending_flushed += retry_pending()
+            remaining = pending_count()
+            final_1540_done = any(value.endswith("T15:40:00+08:00") for value in final_checks)
+            if final_1540_done and remaining == 0:
+                write_json_atomic(status_path, {
+                    "state": "STOPPED",
+                    "stopped_at": now.isoformat(timespec="seconds"),
+                    "reason": "post-close final checks completed",
+                    "final_checks": final_checks,
+                    "pending_flushed": pending_flushed,
+                    "pending_files": 0,
+                })
+                return
+            if current_time >= FINAL_RETRY_DEADLINE:
+                write_json_atomic(status_path, {
+                    "state": "STOPPED",
+                    "stopped_at": now.isoformat(timespec="seconds"),
+                    "reason": "post-close hard deadline reached",
+                    "final_checks": final_checks,
+                    "pending_flushed": pending_flushed,
+                    "pending_files": remaining,
+                    "warning": None if final_1540_done else "15:40 final snapshot was not completed",
+                })
+                return
+            write_json_atomic(status_path, {
+                "state": "FINALIZING",
+                "phase": "post_close_upload_retry",
+                "time": now.isoformat(timespec="seconds"),
+                "final_checks": final_checks,
+                "pending_flushed": pending_flushed,
+                "pending_files": remaining,
+            })
+            time.sleep(10)
+            continue
+
+        market_phase = phase(current_time)
         monotonic_now = time.monotonic()
         if (
             market_phase in {"continuous_am", "continuous_pm"}
             and monotonic_now - last_repair_check >= 600
         ):
-            maybe_start(now, minimum_gap=3, sleep_seconds=0.5)
+            maybe_start(now, minimum_gap=1, sleep_seconds=0.5, safety_delay=5)
             last_repair_check = monotonic_now
 
         if market_phase == "idle":
+            idle_phase = "post_close_wait" if dt_time(15, 12) < current_time < dt_time(15, 40) else "idle"
             write_json_atomic(status_path, {
                 "state": "IDLE",
-                "phase": "idle",
+                "phase": idle_phase,
                 "time": now.isoformat(timespec="seconds"),
+                **_status_base(final_checks),
             })
             time.sleep(10)
             continue
@@ -132,7 +191,7 @@ def run():
             try:
                 result = post_batch(SERV00_INGEST_URL, SERV00_API_TOKEN, payload)
                 upload_state, error = "OK", None
-                retry_pending()
+                pending_flushed += retry_pending()
             except Exception as exc:
                 upload_state, error = "PENDING", str(exc)
                 save_pending(
@@ -141,10 +200,14 @@ def run():
                 )
                 result = None
 
+            if _is_final_check(bucket) and bucket.isoformat(timespec="seconds") not in final_checks:
+                final_checks.append(bucket.isoformat(timespec="seconds"))
+
             write_json_atomic(status_path, {
                 "state": "RUNNING",
                 "phase": market_phase,
                 "last_snapshot": bucket.isoformat(timespec="seconds"),
+                "is_final_check": _is_final_check(bucket),
                 "rows": len(records),
                 "unique_sectors": len({record["sector_code"] for record in records}),
                 "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
@@ -152,7 +215,8 @@ def run():
                 "serv00_state": upload_state,
                 "serv00_result": result,
                 "error": error,
-                "pending_files": len(list((DATA_DIR / "pending").glob("*.json"))),
+                "pending_flushed": pending_flushed,
+                **_status_base(final_checks),
             })
             last_bucket = bucket
         except Exception as exc:
@@ -161,6 +225,7 @@ def run():
                 "phase": market_phase,
                 "time": now.isoformat(timespec="seconds"),
                 "error": f"{type(exc).__name__}: {exc}",
+                **_status_base(final_checks),
             })
             time.sleep(10)
 
