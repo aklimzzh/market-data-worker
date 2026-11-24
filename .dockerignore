@@ -1,0 +1,50 @@
+# Git / CI metadata
+.git
+.gitignore
+
+# Python generated files
+**/__pycache__/
+**/*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and local configuration
+.env
+.env.*
+*.env
+config/
+
+# Runtime / probe output
+logs/
+probe_output/
+data/
+status/
+*.log
+*.tmp
+
+# Archives and local artifacts
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Documentation does not participate in image build
+README*
+DEPLOY*
+docs/
