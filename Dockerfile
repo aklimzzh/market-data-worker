@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11.18-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -13,9 +13,12 @@ RUN apt-get update && \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# Keep dependency installation in its own stable layer.
+# Normal app/src changes will not invalidate this layer.
+COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy frequently-changing application code last.
 COPY app ./app
 COPY src ./src
 
