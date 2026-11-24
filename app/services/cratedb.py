@@ -127,7 +127,6 @@ def upload_1m(rows: Iterable[list[Any]], batch_size: int = 1000) -> int:
 
 def replace_aggregates(trade_date: str) -> None:
     sql("DELETE FROM doc.sector_flow_5m WHERE trade_date = ?", [trade_date])
-    sql("DELETE FROM doc.sector_flow_daily WHERE trade_date = ?", [trade_date])
     sql(
         """
         INSERT INTO doc.sector_flow_5m (
@@ -159,6 +158,12 @@ def replace_aggregates(trade_date: str) -> None:
         FROM doc.sector_flow_1m
         WHERE trade_date = ?
         GROUP BY source,sector_code,trade_date
+        ON CONFLICT (source,sector_code,trade_date) DO UPDATE SET
+          sector_type=excluded.sector_type,sector_name=excluded.sector_name,
+          close_ts=excluded.close_ts,avg_price=excluded.avg_price,
+          pct_change=excluded.pct_change,in_amount=excluded.in_amount,
+          out_amount=excluded.out_amount,net_amount=excluded.net_amount,
+          net_ratio=excluded.net_ratio
         """,
         [trade_date],
     )
@@ -170,3 +175,61 @@ def counts(trade_date: str) -> dict[str, int]:
         result = sql(f"SELECT count(*) FROM doc.{table} WHERE trade_date = ?", [trade_date])
         output[table] = int(result["rows"][0][0])
     return output
+
+DAILY_EXTRA_COLUMNS = (
+    ("turnover", "DOUBLE PRECISION"),
+    ("main_net_amount", "DOUBLE PRECISION"),
+    ("main_net_ratio", "DOUBLE PRECISION"),
+    ("main_compass", "DOUBLE PRECISION"),
+    ("main_compass_count", "INTEGER"),
+)
+
+INSERT_DAILY = """
+INSERT INTO doc.sector_flow_daily (
+ source,sector_code,sector_type,sector_name,trade_date,close_ts,
+ avg_price,pct_change,in_amount,out_amount,net_amount,net_ratio,
+ turnover,main_net_amount,main_net_ratio,main_compass,main_compass_count
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT (source,sector_code,trade_date) DO UPDATE SET
+ sector_type=excluded.sector_type, sector_name=excluded.sector_name,
+ close_ts=excluded.close_ts, avg_price=excluded.avg_price,
+ pct_change=excluded.pct_change, in_amount=coalesce(excluded.in_amount,sector_flow_daily.in_amount),
+ out_amount=coalesce(excluded.out_amount,sector_flow_daily.out_amount),
+ net_amount=excluded.net_amount, net_ratio=excluded.net_ratio,
+ turnover=excluded.turnover, main_net_amount=excluded.main_net_amount,
+ main_net_ratio=excluded.main_net_ratio, main_compass=excluded.main_compass,
+ main_compass_count=excluded.main_compass_count
+"""
+
+_original_ensure_schema = ensure_schema
+
+def ensure_schema() -> None:
+    _original_ensure_schema()
+    for column, data_type in DAILY_EXTRA_COLUMNS:
+        try:
+            sql(f"ALTER TABLE doc.sector_flow_daily ADD COLUMN IF NOT EXISTS {column} {data_type}")
+        except Exception as exc:
+            # Compatible with older CrateDB versions that report an existing column.
+            if "already exists" not in str(exc).lower():
+                raise
+
+
+def upload_daily(records: Iterable[dict[str, Any]], batch_size: int = 1000) -> int:
+    batch: list[list[Any]] = []
+    total = 0
+    for item in records:
+        batch.append([
+            item.get("source", "sina"), item["sector_code"], item["sector_type"], item["sector_name"],
+            item["trade_date"], item["close_ts"], item.get("avg_price"), item.get("pct_change"),
+            item.get("in_amount"), item.get("out_amount"), item.get("net_amount"), item.get("net_ratio"),
+            item.get("turnover"), item.get("main_net_amount"), item.get("main_net_ratio"),
+            item.get("main_compass"), item.get("main_compass_count"),
+        ])
+        if len(batch) >= batch_size:
+            result = sql(INSERT_DAILY, bulk_args=batch)
+            total += len(result.get("results", []))
+            batch.clear()
+    if batch:
+        result = sql(INSERT_DAILY, bulk_args=batch)
+        total += len(result.get("results", []))
+    return total

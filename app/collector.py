@@ -14,7 +14,8 @@ from .config import (
     SERV00_INGEST_URL,
     SINA_INTERVAL,
 )
-from .services.intraday_repair import maybe_start
+from .services.intraday_repair import maybe_start, repair_now
+from .services.daily_finalize import finalize_parquet
 from .services.local_store import append_csv, save_pending, write_json_atomic
 from .services.serv00 import post_batch
 from .sources.sina import fetch_snapshot
@@ -105,6 +106,7 @@ def run():
     last_repair_check = 0.0
     final_checks: list[str] = []
     pending_flushed = 0
+    finalization_result = None
     status_path = DATA_DIR / "status" / "collector.json"
 
     while True:
@@ -115,15 +117,32 @@ def run():
         # everything is delivered. 15:44 is the hard deadline; host safety-stop
         # remains at 15:45.
         if dt_time(15, 40) < current_time:
+            final_1540_done = any(value.endswith("T15:40:00+08:00") for value in final_checks)
+            if final_1540_done and finalization_result is None:
+                try:
+                    print("[FINALIZE] final repair started", flush=True)
+                    repair_result = repair_now(now, sleep_seconds=0.25)
+                    parquet_result = finalize_parquet(now.date())
+                    finalization_result = {
+                        "repair": repair_result,
+                        "parquet": parquet_result,
+                    }
+                    print(f"[FINALIZE] completed complete={parquet_result.get('complete')}", flush=True)
+                except Exception as exc:
+                    finalization_result = {
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "completed_at": datetime.now(TZ).isoformat(timespec="seconds"),
+                    }
+                    print(f"[FINALIZE] failed: {finalization_result['error']}", flush=True)
             pending_flushed += retry_pending()
             remaining = pending_count()
-            final_1540_done = any(value.endswith("T15:40:00+08:00") for value in final_checks)
-            if final_1540_done and remaining == 0:
+            if final_1540_done and finalization_result is not None and remaining == 0:
                 write_json_atomic(status_path, {
                     "state": "STOPPED",
                     "stopped_at": now.isoformat(timespec="seconds"),
-                    "reason": "post-close final checks completed",
+                    "reason": "post-close final repair and parquet completed",
                     "final_checks": final_checks,
+                    "finalization": finalization_result,
                     "pending_flushed": pending_flushed,
                     "pending_files": 0,
                 })
@@ -136,6 +155,7 @@ def run():
                     "final_checks": final_checks,
                     "pending_flushed": pending_flushed,
                     "pending_files": remaining,
+                    "finalization": finalization_result,
                     "warning": None if final_1540_done else "15:40 final snapshot was not completed",
                 })
                 return

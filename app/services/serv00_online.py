@@ -111,3 +111,8 @@ def upload_online_history(frame: pd.DataFrame) -> dict[str, Any]:
         "sector_flow_daily": uploaded_daily,
         "retention": retention,
     }
+
+
+def upload_daily_records(records: list[dict[str, Any]]) -> int:
+    """Upload already-aggregated Sina daily history without rebuilding from 1m."""
+    return _upload("daily", records)
