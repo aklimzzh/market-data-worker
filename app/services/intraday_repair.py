@@ -5,7 +5,7 @@ import json
 import threading
 import time
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -47,10 +47,29 @@ def _phase_for_tick(ticktime: str) -> str | None:
     return None
 
 
+def _trading_minutes_before(trade_date: date, cutoff: datetime) -> set[str]:
+    """Return expected trading-minute timestamps older than the safe cutoff."""
+    cutoff = cutoff.astimezone(TZ).replace(second=0, microsecond=0)
+    expected: set[str] = set()
+    sessions = ((9, 30, 11, 30), (13, 0, 15, 0))
+    for sh, sm, eh, em in sessions:
+        cursor = datetime(trade_date.year, trade_date.month, trade_date.day, sh, sm, tzinfo=TZ)
+        end = datetime(trade_date.year, trade_date.month, trade_date.day, eh, em, tzinfo=TZ)
+        while cursor <= end and cursor < cutoff:
+            expected.add(cursor.isoformat(timespec="seconds"))
+            cursor += timedelta(minutes=1)
+    return expected
+
+
+def _missing_minutes(trade_date: date, now: datetime, safety_delay: int) -> tuple[set[str], set[str], datetime]:
+    safe_cutoff = now.astimezone(TZ).replace(second=0, microsecond=0) - timedelta(minutes=safety_delay)
+    expected = _trading_minutes_before(trade_date, safe_cutoff)
+    existing = _existing_minutes(trade_date)
+    return expected - existing, expected, safe_cutoff
+
+
 def _record(sector: dict, point: dict) -> dict:
-    minute = datetime.fromisoformat(
-        f"{point['opendate']}T{point['ticktime']}"
-    ).replace(tzinfo=TZ)
+    minute = datetime.fromisoformat(f"{point['opendate']}T{point['ticktime']}").replace(tzinfo=TZ)
     return {
         "trade_date": point["opendate"],
         "minute_ts": minute.isoformat(timespec="seconds"),
@@ -79,18 +98,25 @@ def _write_status(trade_date: date, payload: dict) -> None:
     write_json_atomic(path, payload)
 
 
-def _worker(trade_date: date, now: datetime, minimum_gap: int, sleep_seconds: float) -> None:
+def _worker(
+    trade_date: date,
+    now: datetime,
+    candidate_minutes: set[str],
+    safe_cutoff: datetime,
+    sleep_seconds: float,
+) -> None:
     global _RUNNING
     started = datetime.now(TZ)
     status = {
         "state": "RUNNING",
         "trade_date": trade_date.isoformat(),
         "started_at": started.isoformat(timespec="seconds"),
-        "cutoff": now.replace(second=0, microsecond=0).isoformat(timespec="seconds"),
+        "started_from": now.replace(second=0, microsecond=0).isoformat(timespec="seconds"),
+        "safe_cutoff": safe_cutoff.isoformat(timespec="seconds"),
+        "candidate_minutes": sorted(candidate_minutes),
     }
     _write_status(trade_date, status)
     try:
-        existing = _existing_minutes(trade_date)
         session = requests.Session()
         sectors = sector_catalog(session)
         if len(sectors) != 229:
@@ -106,37 +132,22 @@ def _worker(trade_date: date, now: datetime, minimum_gap: int, sleep_seconds: fl
                     if phase is None:
                         continue
                     record = _record(sector, point)
-                    if record["minute_ts"] < status["cutoff"]:
+                    if record["minute_ts"] in candidate_minutes:
                         grouped[record["minute_ts"]].append(record)
             except Exception as exc:
                 failures.append({"sector": sector["sector_code"], "error": str(exc)})
             if index % 25 == 0 or index == 229:
-                print(
-                    f"[INTRADAY-REPAIR] fetched={index}/229 failures={len(failures)}",
-                    flush=True,
-                )
+                print(f"[INTRADAY-REPAIR] fetched={index}/229 failures={len(failures)}", flush=True)
             time.sleep(sleep_seconds)
 
         if failures:
             raise RuntimeError(f"history fetch failed for {len(failures)} sectors")
 
-        available = sorted(grouped)
-        missing = [minute for minute in available if minute not in existing]
-        if len(missing) < minimum_gap:
-            status.update({
-                "state": "SKIPPED",
-                "reason": f"missing minutes below threshold {minimum_gap}",
-                "missing_minutes": len(missing),
-                "finished_at": datetime.now(TZ).isoformat(timespec="seconds"),
-            })
-            _write_status(trade_date, status)
-            return
-
         repaired = []
         skipped = []
         csv_path = _csv_path(trade_date)
-        for minute in missing:
-            records = grouped[minute]
+        for minute in sorted(candidate_minutes):
+            records = grouped.get(minute, [])
             unique = {item["sector_code"]: item for item in records}
             if len(unique) != 229:
                 skipped.append({"minute_ts": minute, "records": len(unique)})
@@ -156,8 +167,7 @@ def _worker(trade_date: date, now: datetime, minimum_gap: int, sleep_seconds: fl
 
         status.update({
             "state": "SUCCESS" if not skipped else "PARTIAL",
-            "available_minutes": len(available),
-            "missing_minutes": len(missing),
+            "missing_minutes": len(candidate_minutes),
             "repaired_minutes": repaired,
             "skipped_minutes": skipped,
             "finished_at": datetime.now(TZ).isoformat(timespec="seconds"),
@@ -176,25 +186,19 @@ def _worker(trade_date: date, now: datetime, minimum_gap: int, sleep_seconds: fl
             _RUNNING = False
 
 
-def maybe_start(now: datetime, minimum_gap: int = 3, sleep_seconds: float = 0.5) -> bool:
+def maybe_start(
+    now: datetime,
+    minimum_gap: int = 1,
+    sleep_seconds: float = 0.5,
+    safety_delay: int = 5,
+) -> bool:
+    """Start a background repair when any internally missing safe minute exists."""
     global _RUNNING
     if not SERV00_INGEST_URL:
         return False
-    trade_date = now.date()
-    existing = sorted(_existing_minutes(trade_date))
-    current = now.replace(second=0, microsecond=0)
-    if existing:
-        last = datetime.fromisoformat(existing[-1])
-        gap_minutes = int((current - last).total_seconds() // 60) - 1
-    else:
-        # The collector may have missed the entire morning after an OpenWrt outage.
-        morning_start = current.replace(hour=9, minute=30)
-        afternoon_start = current.replace(hour=13, minute=0)
-        if current < afternoon_start:
-            gap_minutes = max(0, int((current - morning_start).total_seconds() // 60))
-        else:
-            gap_minutes = 121 + max(0, int((current - afternoon_start).total_seconds() // 60))
-    if gap_minutes < minimum_gap:
+    trade_date = now.astimezone(TZ).date()
+    missing, expected, safe_cutoff = _missing_minutes(trade_date, now, safety_delay)
+    if len(missing) < minimum_gap:
         return False
     with _LOCK:
         if _RUNNING:
@@ -202,10 +206,14 @@ def maybe_start(now: datetime, minimum_gap: int = 3, sleep_seconds: float = 0.5)
         _RUNNING = True
     thread = threading.Thread(
         target=_worker,
-        args=(trade_date, now, minimum_gap, sleep_seconds),
+        args=(trade_date, now, missing, safe_cutoff, sleep_seconds),
         name="intraday-repair",
         daemon=True,
     )
     thread.start()
-    print(f"[INTRADAY-REPAIR] started gap_minutes={gap_minutes}", flush=True)
+    print(
+        f"[INTRADAY-REPAIR] started missing={len(missing)} "
+        f"expected={len(expected)} safety_delay={safety_delay}min",
+        flush=True,
+    )
     return True
