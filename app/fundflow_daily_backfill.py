@@ -36,8 +36,8 @@ def _write_status(payload: dict) -> None:
     temp.replace(path)
 
 
-def run(days: int = 100, sleep_seconds: float = 0.3) -> dict:
-    if days < 1 or days > 100:
+def run(days: int = 250, sleep_seconds: float = 0.3) -> dict:
+    if days < 1 or days > 250:
         raise ValueError("days must be between 1 and 100")
 
     result = {
