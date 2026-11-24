@@ -74,8 +74,8 @@ INSERT INTO doc.sector_flow_daily (
 ON CONFLICT (source,sector_code,trade_date) DO UPDATE SET
  sector_type=excluded.sector_type,sector_name=excluded.sector_name,close_ts=excluded.close_ts,
  avg_price=excluded.avg_price,pct_change=excluded.pct_change,
- in_amount=coalesce(excluded.in_amount,sector_flow_daily.in_amount),
- out_amount=coalesce(excluded.out_amount,sector_flow_daily.out_amount),
+ in_amount=coalesce(excluded.in_amount,in_amount),
+ out_amount=coalesce(excluded.out_amount,out_amount),
  net_amount=excluded.net_amount,net_ratio=excluded.net_ratio,turnover=excluded.turnover,
  main_net_amount=excluded.main_net_amount,main_net_ratio=excluded.main_net_ratio,
  main_compass=excluded.main_compass,main_compass_count=excluded.main_compass_count
