@@ -47,3 +47,34 @@ def finalize(day):
  return {"trade_date":str(day),"rows":len(f),"index_count":int(f.index_code.nunique()),"minute_count":int(f.minute_ts.nunique()),"expected_minutes":241,"incomplete_minutes":bad,"complete":not bad and int(f.minute_ts.nunique())==241,"parquet":str(out)}
 def retention():
  r=requests.post(endpoint().replace("/import","/retention"),headers={"Authorization":f"Bearer {SERV00_API_TOKEN}"},timeout=(5,30));r.raise_for_status();return r.json()
+
+
+def upload_batch(records, max_attempts=3):
+    import time
+    if not records or len(records) > 400:
+        raise ValueError("batch must contain 1..400 records")
+    url = endpoint().replace("/minute/import", "/minute/batch")
+    delays = (0, 2, 5)
+    last_error = None
+    for attempt in range(max_attempts):
+        if delays[attempt]:
+            time.sleep(delays[attempt])
+        try:
+            response = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {SERV00_API_TOKEN}"},
+                json={"records": records},
+                timeout=(10, 90),
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            last_error = exc
+    raise RuntimeError(f"batch upload failed after {max_attempts} attempts: {last_error}")
+
+
+def remote_status(days=60):
+    url = endpoint().replace("/minute/import", "/minute/status")
+    response = requests.get(url, params={"days": days}, timeout=(10, 60))
+    response.raise_for_status()
+    return response.json()

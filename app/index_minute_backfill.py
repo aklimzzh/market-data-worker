@@ -10,7 +10,7 @@ import akshare as ak
 import pandas as pd
 
 from .config import DATA_DIR
-from .services.index_minute import upload
+from .services.index_minute import remote_status, upload_batch
 from .sources.index_realtime import CONFIG
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -159,39 +159,48 @@ def run(start: str, end: str, sleep_seconds: float = 0.10, dry_run: bool = False
     data = pd.concat(frames, ignore_index=True)
     all_codes = set(CONFIG)
     uploaded = 0
-    incomplete: list[dict] = []
+    skipped_days: list[str] = []
+    repaired_days: list[str] = []
     upload_failures: list[dict] = []
     parquet_files: list[str] = []
 
-    for trade_day, day_frame in data.groupby("trade_date", sort=True):
-        complete_rows: list[pd.DataFrame] = []
-        for minute_ts, minute_frame in day_frame.groupby("minute_ts", sort=True):
-            codes = set(minute_frame["index_code"])
-            if codes != all_codes:
-                incomplete.append(
-                    {
-                        "minute_ts": str(minute_ts),
-                        "present": sorted(codes),
-                        "missing": sorted(all_codes - codes),
-                    }
-                )
-                continue
-            complete_rows.append(minute_frame)
-            if not dry_run:
-                records = [_record(row) for _, row in minute_frame.iterrows()]
-                try:
-                    result = upload(records)
-                    uploaded += int(result.get("upserted", len(records)))
-                except Exception as exc:
-                    upload_failures.append(
-                        {"minute_ts": str(minute_ts), "error": f"{type(exc).__name__}: {exc}"}
-                    )
-                if sleep_seconds > 0:
-                    time.sleep(sleep_seconds)
+    remote = {} if dry_run else remote_status(60)
+    remote_counts = {
+        (str(item.get("trade_date")), item.get("index_code")): int(item.get("row_count", 0))
+        for item in remote.get("data", [])
+    }
 
-        if complete_rows:
-            parquet_frame = pd.concat(complete_rows, ignore_index=True)
-            parquet_files.append(_write_day_parquet(trade_day, parquet_frame))
+    for trade_day, day_frame in data.groupby("trade_date", sort=True):
+        day_frame = day_frame.sort_values(["minute_ts", "index_code"])
+        expected = {
+            code: int((day_frame["index_code"] == code).sum()) for code in all_codes
+        }
+        is_complete = all(
+            remote_counts.get((trade_day.isoformat(), code), 0) >= count
+            for code, count in expected.items()
+        )
+        parquet_files.append(_write_day_parquet(trade_day, day_frame))
+        if is_complete and not dry_run:
+            skipped_days.append(trade_day.isoformat())
+            continue
+        repaired_days.append(trade_day.isoformat())
+        records = [_record(row) for _, row in day_frame.iterrows()]
+        if dry_run:
+            continue
+        for offset in range(0, len(records), 400):
+            batch = records[offset:offset + 400]
+            try:
+                result = upload_batch(batch)
+                uploaded += int(result.get("upserted", len(batch)))
+            except Exception as exc:
+                upload_failures.append({
+                    "trade_date": trade_day.isoformat(),
+                    "offset": offset,
+                    "rows": len(batch),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
 
     state = "SUCCESS"
     if incomplete or upload_failures:
@@ -204,8 +213,8 @@ def run(start: str, end: str, sleep_seconds: float = 0.10, dry_run: bool = False
         "source_availability": availability,
         "source_rows": int(len(data)),
         "uploaded_rows": uploaded,
-        "incomplete_minute_count": len(incomplete),
-        "incomplete_minutes": incomplete[:100],
+        "skipped_complete_days": skipped_days,
+        "processed_days": repaired_days,
         "upload_failure_count": len(upload_failures),
         "upload_failures": upload_failures[:100],
         "parquet_files": parquet_files,
