@@ -1,65 +1,220 @@
 from __future__ import annotations
+
 import json
+import time
 from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
 import akshare as ak
 import pandas as pd
+
 from .config import DATA_DIR
 from .services.index_minute import upload
 from .sources.index_realtime import CONFIG
-TZ=ZoneInfo("Asia/Shanghai")
-ALIASES={"day":"minute_ts","时间":"minute_ts","datetime":"minute_ts","date":"minute_ts","close":"price","收盘":"price","volume":"volume","成交量":"volume","amount":"amount","成交额":"amount"}
 
-def _fetch(symbol:str)->pd.DataFrame:
-    errors=[]
-    for call in (
+TZ = ZoneInfo("Asia/Shanghai")
+
+COLUMN_ALIASES = {
+    "day": "minute_ts",
+    "date": "minute_ts",
+    "datetime": "minute_ts",
+    "时间": "minute_ts",
+    "close": "close_price",
+    "收盘": "close_price",
+    "volume": "minute_volume",
+    "成交量": "minute_volume",
+    "amount": "minute_amount",
+    "成交额": "minute_amount",
+}
+
+
+def _fetch_sina(symbol: str) -> pd.DataFrame:
+    """Fetch the recent 1-minute window supported by the installed AKShare."""
+    errors: list[str] = []
+    calls = (
         lambda: ak.stock_zh_a_hist_min_sina(symbol=symbol, period="1"),
         lambda: ak.stock_zh_a_minute(symbol=symbol, period="1", adjust=""),
-    ):
+    )
+    for call in calls:
         try:
-            frame=call()
-            if isinstance(frame,pd.DataFrame) and not frame.empty: return frame
-        except Exception as exc: errors.append(f"{type(exc).__name__}: {exc}")
+            frame = call()
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                return frame
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
     raise RuntimeError(f"no compatible Sina 1m function for {symbol}: {errors}")
 
-def _normalise(frame:pd.DataFrame,code:str)->pd.DataFrame:
-    renamed={c:ALIASES.get(str(c).strip(),str(c).strip().lower()) for c in frame.columns}
-    f=frame.rename(columns=renamed).copy()
-    required={"minute_ts","price","volume"}
-    if not required.issubset(f.columns): raise RuntimeError(f"{code}: columns unavailable: {list(frame.columns)}")
-    f["minute_ts"]=pd.to_datetime(f["minute_ts"],errors="coerce")
-    f=f.dropna(subset=["minute_ts"]).sort_values("minute_ts")
-    if "amount" not in f.columns: f["amount"]=None
-    symbol,name=CONFIG[code][1],CONFIG[code][2]
-    f["index_code"]=code; f["index_symbol"]=symbol; f["index_name"]=name; f["source"]="sina"
-    return f
 
-def run(start:str,end:str)->dict:
-    start_day=date.fromisoformat(start); end_day=date.fromisoformat(end)
-    if start_day>end_day: raise ValueError("start cannot be later than end")
-    frames=[]
-    for code,(sina_symbol,_,_) in CONFIG.items():
-        f=_normalise(_fetch(sina_symbol),code)
-        local_dates=f["minute_ts"].dt.date
-        f=f[(local_dates>=start_day)&(local_dates<=end_day)]
-        if f.empty: raise RuntimeError(f"{code}: requested range unavailable from Sina")
-        frames.append(f)
-    all_rows=pd.concat(frames,ignore_index=True)
-    all_rows["minute_ts"]=all_rows["minute_ts"].dt.tz_localize(TZ,ambiguous="NaT",nonexistent="NaT")
-    all_rows=all_rows.dropna(subset=["minute_ts"]).sort_values(["minute_ts","index_code"])
-    uploaded=0; incomplete=[]
-    for minute,group in all_rows.groupby("minute_ts"):
-        records=[]
-        for _,r in group.iterrows():
-            records.append({"index_code":r.index_code,"index_symbol":r.index_symbol,"index_name":r.index_name,
-              "trade_date":minute.date().isoformat(),"minute_ts":minute.isoformat(timespec="seconds"),
-              "price":None if pd.isna(r.price) else float(r.price),"volume":None if pd.isna(r.volume) else float(r.volume),
-              "amount":None if pd.isna(r.amount) else float(r.amount),"period_price_change":None,
-              "period_volume":None,"period_amount":None,"market_phase":"backfill","source":"sina"})
-        if len(records)!=4: incomplete.append({"minute_ts":minute.isoformat(),"indexes":len(records)}); continue
-        upload(records); uploaded+=4
-    archive=DATA_DIR/"index_archive"/"backfill"/f"{start}_{end}.parquet"; archive.parent.mkdir(parents=True,exist_ok=True)
-    all_rows.to_parquet(archive,index=False,compression="zstd")
-    result={"state":"SUCCESS" if not incomplete else "PARTIAL","start":start,"end":end,"rows":len(all_rows),"uploaded":uploaded,"incomplete":incomplete,"parquet":str(archive),"finished_at":datetime.now(TZ).isoformat(timespec="seconds")}
-    path=DATA_DIR/"status"/f"index_minute_backfill_{start}_{end}.json"; path.parent.mkdir(parents=True,exist_ok=True); path.write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding="utf-8")
-    print(json.dumps(result,ensure_ascii=False,indent=2)); return result
+def _normalise(frame: pd.DataFrame, code: str) -> pd.DataFrame:
+    renamed = {
+        column: COLUMN_ALIASES.get(str(column).strip(), str(column).strip().lower())
+        for column in frame.columns
+    }
+    data = frame.rename(columns=renamed).copy()
+    required = {"minute_ts", "close_price", "minute_volume"}
+    missing = required - set(data.columns)
+    if missing:
+        raise RuntimeError(
+            f"{code}: missing columns {sorted(missing)}; actual={list(frame.columns)}"
+        )
+
+    data["minute_ts"] = pd.to_datetime(data["minute_ts"], errors="coerce")
+    data["close_price"] = pd.to_numeric(data["close_price"], errors="coerce")
+    data["minute_volume"] = pd.to_numeric(data["minute_volume"], errors="coerce")
+    if "minute_amount" not in data.columns:
+        data["minute_amount"] = pd.NA
+    data["minute_amount"] = pd.to_numeric(data["minute_amount"], errors="coerce")
+    data = data.dropna(subset=["minute_ts", "close_price", "minute_volume"])
+    data = data.sort_values("minute_ts").drop_duplicates("minute_ts", keep="last")
+
+    symbol, name = CONFIG[code][1], CONFIG[code][2]
+    data["index_code"] = code
+    data["index_symbol"] = symbol
+    data["index_name"] = name
+    data["trade_date"] = data["minute_ts"].dt.date
+    data["source"] = "sina"
+
+    # The historical AKShare endpoint returns per-minute volume/amount, unlike
+    # the real-time quote endpoint which returns cumulative values.
+    data["minute_volume"] = data["minute_volume"].round().astype("int64")
+    data["cumulative_volume"] = data.groupby("trade_date")["minute_volume"].cumsum()
+    data["cumulative_amount"] = data.groupby("trade_date")["minute_amount"].cumsum()
+    data["period_price_change"] = data.groupby("trade_date")["close_price"].diff()
+    data["change_pct"] = pd.NA
+    return data
+
+
+def _json_number(value, integer: bool = False):
+    if pd.isna(value):
+        return None
+    return int(value) if integer else float(value)
+
+
+def _record(row: pd.Series) -> dict:
+    minute = row["minute_ts"]
+    if minute.tzinfo is None:
+        minute = minute.tz_localize(TZ)
+    else:
+        minute = minute.tz_convert(TZ)
+    return {
+        "index_code": row["index_code"],
+        "index_symbol": row["index_symbol"],
+        "index_name": row["index_name"],
+        "trade_date": row["trade_date"].isoformat(),
+        "minute_ts": minute.isoformat(timespec="seconds"),
+        "close_price": _json_number(row["close_price"]),
+        "change_pct": _json_number(row["change_pct"]),
+        "cumulative_volume": _json_number(row["cumulative_volume"], integer=True),
+        "cumulative_amount": _json_number(row["cumulative_amount"]),
+        "minute_volume": _json_number(row["minute_volume"], integer=True),
+        "minute_amount": _json_number(row["minute_amount"]),
+        "period_price_change": _json_number(row["period_price_change"]),
+        "source": "sina",
+    }
+
+
+def _write_day_parquet(day: date, day_frame: pd.DataFrame) -> str:
+    target = (
+        DATA_DIR
+        / "index_archive"
+        / day.strftime("%Y/%m")
+        / f"{day.isoformat()}.parquet"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    day_frame.sort_values(["minute_ts", "index_code"]).to_parquet(
+        target,
+        index=False,
+        compression="zstd",
+    )
+    return str(target)
+
+
+def run(start: str, end: str, sleep_seconds: float = 0.10, dry_run: bool = False) -> dict:
+    start_day = date.fromisoformat(start)
+    end_day = date.fromisoformat(end)
+    if start_day > end_day:
+        raise ValueError("start cannot be later than end")
+
+    frames: list[pd.DataFrame] = []
+    availability: dict[str, dict] = {}
+    for code, (sina_symbol, _, _) in CONFIG.items():
+        frame = _normalise(_fetch_sina(sina_symbol), code)
+        available_start = frame["trade_date"].min()
+        available_end = frame["trade_date"].max()
+        availability[code] = {
+            "available_start": available_start.isoformat(),
+            "available_end": available_end.isoformat(),
+        }
+        frame = frame[
+            (frame["trade_date"] >= start_day) & (frame["trade_date"] <= end_day)
+        ]
+        if frame.empty:
+            raise RuntimeError(
+                f"{code}: requested range {start}..{end} is outside Sina window "
+                f"{available_start}..{available_end}"
+            )
+        frames.append(frame)
+
+    data = pd.concat(frames, ignore_index=True)
+    all_codes = set(CONFIG)
+    uploaded = 0
+    incomplete: list[dict] = []
+    upload_failures: list[dict] = []
+    parquet_files: list[str] = []
+
+    for trade_day, day_frame in data.groupby("trade_date", sort=True):
+        complete_rows: list[pd.DataFrame] = []
+        for minute_ts, minute_frame in day_frame.groupby("minute_ts", sort=True):
+            codes = set(minute_frame["index_code"])
+            if codes != all_codes:
+                incomplete.append(
+                    {
+                        "minute_ts": str(minute_ts),
+                        "present": sorted(codes),
+                        "missing": sorted(all_codes - codes),
+                    }
+                )
+                continue
+            complete_rows.append(minute_frame)
+            if not dry_run:
+                records = [_record(row) for _, row in minute_frame.iterrows()]
+                try:
+                    result = upload(records)
+                    uploaded += int(result.get("upserted", len(records)))
+                except Exception as exc:
+                    upload_failures.append(
+                        {"minute_ts": str(minute_ts), "error": f"{type(exc).__name__}: {exc}"}
+                    )
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+
+        if complete_rows:
+            parquet_frame = pd.concat(complete_rows, ignore_index=True)
+            parquet_files.append(_write_day_parquet(trade_day, parquet_frame))
+
+    state = "SUCCESS"
+    if incomplete or upload_failures:
+        state = "PARTIAL"
+    result = {
+        "state": state,
+        "dry_run": dry_run,
+        "requested_start": start,
+        "requested_end": end,
+        "source_availability": availability,
+        "source_rows": int(len(data)),
+        "uploaded_rows": uploaded,
+        "incomplete_minute_count": len(incomplete),
+        "incomplete_minutes": incomplete[:100],
+        "upload_failure_count": len(upload_failures),
+        "upload_failures": upload_failures[:100],
+        "parquet_files": parquet_files,
+        "finished_at": datetime.now(TZ).isoformat(timespec="seconds"),
+    }
+    status_path = DATA_DIR / "status" / f"index_minute_backfill_{start}_{end}.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    if upload_failures and not dry_run:
+        raise RuntimeError(f"{len(upload_failures)} minute batches failed to upload")
+    return result
