@@ -10,7 +10,7 @@ from .config import DATA_DIR
 from .fundflow_backfill import run as fundflow_backfill
 from .services.etf_index_repair import repair_etf_exchange, repair_indexes
 from .services.serv00_audit import audit_trade_date
-from .services.index_minute import apply_retention as index_retention
+from .services.index_minute import retention as index_retention
 
 TZ = ZoneInfo("Asia/Shanghai")
 
