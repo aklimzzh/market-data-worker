@@ -7,10 +7,13 @@ START_SCRIPT="$BASE_DIR/start_collector.sh"
 
 mkdir -p "$BASE_DIR/logs"
 
-# Valid recovery windows only. Lunch and pre/post-market are intentionally excluded.
+# Recovery windows (Asia/Shanghai host time):
+# - 09:10-11:29 morning session
+# - 13:00-15:40 afternoon + post-close final-check window
+# Lunch is intentionally excluded.
 HHMM="$(date '+%H%M')"
 case "$HHMM" in
-  09[1-5][0-9]|10[0-5][0-9]|11[0-2][0-9]|13[0-5][0-9]|14[0-5][0-9]|150[0-9]|151[0-2]) ;;
+  09[1-5][0-9]|10[0-5][0-9]|11[0-2][0-9]|13[0-5][0-9]|14[0-5][0-9]|15[0-3][0-9]|1540) ;;
   *) exit 0 ;;
 esac
 

@@ -19,6 +19,7 @@ from .services.daily_finalize import finalize_parquet
 from .services.local_store import append_csv, save_pending, write_json_atomic
 from .services.serv00 import post_batch
 from .sources.sina import fetch_snapshot
+from .services.index_minute import collect as collect_indexes, finalize as finalize_indexes
 
 TZ = ZoneInfo("Asia/Shanghai")
 FINAL_CHECK_TIMES = (dt_time(15, 35), dt_time(15, 40))
@@ -123,9 +124,11 @@ def run():
                     print("[FINALIZE] final repair started", flush=True)
                     repair_result = repair_now(now, sleep_seconds=0.25)
                     parquet_result = finalize_parquet(now.date())
+                    index_parquet_result = finalize_indexes(now.date())
                     finalization_result = {
                         "repair": repair_result,
                         "parquet": parquet_result,
+                        "index": index_parquet_result,
                     }
                     print(f"[FINALIZE] completed complete={parquet_result.get('complete')}", flush=True)
                 except Exception as exc:
@@ -198,6 +201,7 @@ def run():
         started = time.monotonic()
         try:
             raw, request_metrics = fetch_snapshot(session)
+            index_rows, index_upload = collect_indexes(session)
             records = normalize(raw, bucket, market_phase)
             csv_path = DATA_DIR / "raw" / bucket.strftime("%Y/%m") / f"{bucket.date().isoformat()}.csv"
             append_csv(csv_path, records)
@@ -232,6 +236,8 @@ def run():
                 "unique_sectors": len({record["sector_code"] for record in records}),
                 "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
                 "requests": request_metrics,
+                  "index_rows": len(index_rows),
+                  "index_serv00_result": index_upload,
                 "serv00_state": upload_state,
                 "serv00_result": result,
                 "error": error,

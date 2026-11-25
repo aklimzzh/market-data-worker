@@ -1,0 +1,7 @@
+# Trading-day checks are enforced inside reconcile.sh
+45 9 * * 1-5 /mnt/ssd/moneyflow/reconcile.sh all false
+15 13 * * 1-5 /mnt/ssd/moneyflow/reconcile.sh all false
+40 15 * * 1-5 /mnt/ssd/moneyflow/reconcile.sh all true
+45 15 * * 1-5 /mnt/ssd/moneyflow/stop_collector.sh
+# Keep existing daily maintenance schedule separately.
+*/5 9-15 * * 1-5 /mnt/ssd/moneyflow/watchdog.sh

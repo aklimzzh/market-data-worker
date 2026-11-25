@@ -10,6 +10,7 @@ from .config import DATA_DIR
 from .fundflow_backfill import run as fundflow_backfill
 from .services.etf_index_repair import repair_etf_exchange, repair_indexes
 from .services.serv00_audit import audit_trade_date
+from .services.index_minute import apply_retention as index_retention
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -81,6 +82,8 @@ def run(trade_date: str, sleep_seconds: float = 0.5, refresh_calendar: bool = Fa
             "keep_trade_days": 5,
             "removed": removed,
         }
+
+        status["steps"]["index_1m_retention"] = index_retention()
 
         if refresh_calendar:
             print("[CALENDAR] Saturday refresh started", flush=True)
