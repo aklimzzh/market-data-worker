@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import time
 from datetime import date, datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import akshare as ak
@@ -14,216 +13,144 @@ from .services.index_minute import remote_status, upload_batch
 from .sources.index_realtime import CONFIG
 
 TZ = ZoneInfo("Asia/Shanghai")
-
-COLUMN_ALIASES = {
-    "day": "minute_ts",
-    "date": "minute_ts",
-    "datetime": "minute_ts",
-    "时间": "minute_ts",
-    "close": "close_price",
-    "收盘": "close_price",
-    "volume": "minute_volume",
-    "成交量": "minute_volume",
-    "amount": "minute_amount",
-    "成交额": "minute_amount",
+ALIASES = {
+    "day": "minute_ts", "date": "minute_ts", "datetime": "minute_ts", "时间": "minute_ts",
+    "close": "close_price", "收盘": "close_price",
+    "volume": "minute_volume", "成交量": "minute_volume",
+    "amount": "minute_amount", "成交额": "minute_amount",
 }
 
 
-def _fetch_sina(symbol: str) -> pd.DataFrame:
-    """Fetch the recent 1-minute window supported by the installed AKShare."""
-    errors: list[str] = []
-    calls = (
-        lambda: ak.stock_zh_a_hist_min_sina(symbol=symbol, period="1"),
-        lambda: ak.stock_zh_a_minute(symbol=symbol, period="1", adjust=""),
-    )
-    for call in calls:
+def progress(message: str) -> None:
+    print(f"[{datetime.now(TZ).strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def fetch_sina(symbol: str) -> pd.DataFrame:
+    errors = []
+    for name, call in (
+        ("stock_zh_a_hist_min_sina", lambda: ak.stock_zh_a_hist_min_sina(symbol=symbol, period="1")),
+        ("stock_zh_a_minute", lambda: ak.stock_zh_a_minute(symbol=symbol, period="1", adjust="")),
+    ):
         try:
+            progress(f"  trying {name}")
             frame = call()
             if isinstance(frame, pd.DataFrame) and not frame.empty:
                 return frame
         except Exception as exc:
-            errors.append(f"{type(exc).__name__}: {exc}")
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            progress(f"  {name} failed: {type(exc).__name__}: {exc}")
     raise RuntimeError(f"no compatible Sina 1m function for {symbol}: {errors}")
 
 
-def _normalise(frame: pd.DataFrame, code: str) -> pd.DataFrame:
-    renamed = {
-        column: COLUMN_ALIASES.get(str(column).strip(), str(column).strip().lower())
-        for column in frame.columns
-    }
-    data = frame.rename(columns=renamed).copy()
+def normalise(frame: pd.DataFrame, code: str) -> pd.DataFrame:
+    frame = frame.rename(columns={c: ALIASES.get(str(c).strip(), str(c).strip().lower()) for c in frame.columns}).copy()
     required = {"minute_ts", "close_price", "minute_volume"}
-    missing = required - set(data.columns)
-    if missing:
-        raise RuntimeError(
-            f"{code}: missing columns {sorted(missing)}; actual={list(frame.columns)}"
-        )
-
-    data["minute_ts"] = pd.to_datetime(data["minute_ts"], errors="coerce")
-    data["close_price"] = pd.to_numeric(data["close_price"], errors="coerce")
-    data["minute_volume"] = pd.to_numeric(data["minute_volume"], errors="coerce")
-    if "minute_amount" not in data.columns:
-        data["minute_amount"] = pd.NA
-    data["minute_amount"] = pd.to_numeric(data["minute_amount"], errors="coerce")
-    data = data.dropna(subset=["minute_ts", "close_price", "minute_volume"])
-    data = data.sort_values("minute_ts").drop_duplicates("minute_ts", keep="last")
-
+    if not required.issubset(frame.columns):
+        raise RuntimeError(f"{code}: missing {sorted(required-set(frame.columns))}; actual={list(frame.columns)}")
+    frame["minute_ts"] = pd.to_datetime(frame["minute_ts"], errors="coerce")
+    frame["close_price"] = pd.to_numeric(frame["close_price"], errors="coerce")
+    frame["minute_volume"] = pd.to_numeric(frame["minute_volume"], errors="coerce")
+    if "minute_amount" not in frame.columns:
+        frame["minute_amount"] = pd.NA
+    frame["minute_amount"] = pd.to_numeric(frame["minute_amount"], errors="coerce")
+    frame = frame.dropna(subset=["minute_ts", "close_price", "minute_volume"]).sort_values("minute_ts").drop_duplicates("minute_ts", keep="last")
     symbol, name = CONFIG[code][1], CONFIG[code][2]
-    data["index_code"] = code
-    data["index_symbol"] = symbol
-    data["index_name"] = name
-    data["trade_date"] = data["minute_ts"].dt.date
-    data["source"] = "sina"
-
-    # The historical AKShare endpoint returns per-minute volume/amount, unlike
-    # the real-time quote endpoint which returns cumulative values.
-    data["minute_volume"] = data["minute_volume"].round().astype("int64")
-    data["cumulative_volume"] = data.groupby("trade_date")["minute_volume"].cumsum()
-    data["cumulative_amount"] = data.groupby("trade_date")["minute_amount"].cumsum()
-    data["period_price_change"] = data.groupby("trade_date")["close_price"].diff()
-    data["change_pct"] = pd.NA
-    return data
+    frame["index_code"] = code; frame["index_symbol"] = symbol; frame["index_name"] = name
+    frame["trade_date"] = frame["minute_ts"].dt.date; frame["source"] = "sina"
+    frame["minute_volume"] = frame["minute_volume"].round().astype("int64")
+    frame["cumulative_volume"] = frame.groupby("trade_date")["minute_volume"].cumsum()
+    frame["cumulative_amount"] = frame.groupby("trade_date")["minute_amount"].cumsum()
+    frame["period_price_change"] = frame.groupby("trade_date")["close_price"].diff()
+    frame["change_pct"] = pd.NA
+    return frame
 
 
-def _json_number(value, integer: bool = False):
-    if pd.isna(value):
-        return None
+def number(value, integer=False):
+    if pd.isna(value): return None
     return int(value) if integer else float(value)
 
 
-def _record(row: pd.Series) -> dict:
+def record(row: pd.Series) -> dict:
     minute = row["minute_ts"]
-    if minute.tzinfo is None:
-        minute = minute.tz_localize(TZ)
-    else:
-        minute = minute.tz_convert(TZ)
+    minute = minute.tz_localize(TZ) if minute.tzinfo is None else minute.tz_convert(TZ)
     return {
-        "index_code": row["index_code"],
-        "index_symbol": row["index_symbol"],
-        "index_name": row["index_name"],
-        "trade_date": row["trade_date"].isoformat(),
-        "minute_ts": minute.isoformat(timespec="seconds"),
-        "close_price": _json_number(row["close_price"]),
-        "change_pct": _json_number(row["change_pct"]),
-        "cumulative_volume": _json_number(row["cumulative_volume"], integer=True),
-        "cumulative_amount": _json_number(row["cumulative_amount"]),
-        "minute_volume": _json_number(row["minute_volume"], integer=True),
-        "minute_amount": _json_number(row["minute_amount"]),
-        "period_price_change": _json_number(row["period_price_change"]),
-        "source": "sina",
+        "index_code": row["index_code"], "index_symbol": row["index_symbol"], "index_name": row["index_name"],
+        "trade_date": row["trade_date"].isoformat(), "minute_ts": minute.isoformat(timespec="seconds"),
+        "close_price": number(row["close_price"]), "change_pct": number(row["change_pct"]),
+        "cumulative_volume": number(row["cumulative_volume"], True), "cumulative_amount": number(row["cumulative_amount"]),
+        "minute_volume": number(row["minute_volume"], True), "minute_amount": number(row["minute_amount"]),
+        "period_price_change": number(row["period_price_change"]), "source": "sina",
     }
 
 
-def _write_day_parquet(day: date, day_frame: pd.DataFrame) -> str:
-    target = (
-        DATA_DIR
-        / "index_archive"
-        / day.strftime("%Y/%m")
-        / f"{day.isoformat()}.parquet"
-    )
+def write_parquet(day: date, frame: pd.DataFrame) -> str:
+    target = DATA_DIR / "index_archive" / day.strftime("%Y/%m") / f"{day.isoformat()}.parquet"
     target.parent.mkdir(parents=True, exist_ok=True)
-    day_frame.sort_values(["minute_ts", "index_code"]).to_parquet(
-        target,
-        index=False,
-        compression="zstd",
-    )
+    frame.sort_values(["minute_ts", "index_code"]).to_parquet(target, index=False, compression="zstd")
     return str(target)
 
 
 def run(start: str, end: str, sleep_seconds: float = 0.10, dry_run: bool = False) -> dict:
-    start_day = date.fromisoformat(start)
-    end_day = date.fromisoformat(end)
-    if start_day > end_day:
-        raise ValueError("start cannot be later than end")
-
-    frames: list[pd.DataFrame] = []
-    availability: dict[str, dict] = {}
-    for code, (sina_symbol, _, _) in CONFIG.items():
-        frame = _normalise(_fetch_sina(sina_symbol), code)
-        available_start = frame["trade_date"].min()
-        available_end = frame["trade_date"].max()
-        availability[code] = {
-            "available_start": available_start.isoformat(),
-            "available_end": available_end.isoformat(),
-        }
-        frame = frame[
-            (frame["trade_date"] >= start_day) & (frame["trade_date"] <= end_day)
-        ]
-        if frame.empty:
-            raise RuntimeError(
-                f"{code}: requested range {start}..{end} is outside Sina window "
-                f"{available_start}..{available_end}"
-            )
-        frames.append(frame)
-
+    start_day, end_day = date.fromisoformat(start), date.fromisoformat(end)
+    if start_day > end_day: raise ValueError("start cannot be later than end")
+    progress(f"START range={start}..{end} dry_run={dry_run}")
+    frames, availability = [], {}
+    for no, (code, (sina_symbol, _, _)) in enumerate(CONFIG.items(), 1):
+        progress(f"FETCH {no}/4 {code} {sina_symbol} started")
+        t0 = time.monotonic(); frame = normalise(fetch_sina(sina_symbol), code)
+        a, b = frame["trade_date"].min(), frame["trade_date"].max()
+        availability[code] = {"available_start": a.isoformat(), "available_end": b.isoformat()}
+        frame = frame[(frame["trade_date"] >= start_day) & (frame["trade_date"] <= end_day)]
+        progress(f"FETCH {code} done filtered_rows={len(frame)} available={a}..{b} elapsed={time.monotonic()-t0:.1f}s")
+        if not frame.empty: frames.append(frame)
+    if not frames: raise RuntimeError("requested range has no Sina minute data")
     data = pd.concat(frames, ignore_index=True)
-    all_codes = set(CONFIG)
-    uploaded = 0
-    skipped_days: list[str] = []
-    repaired_days: list[str] = []
-    upload_failures: list[dict] = []
-    parquet_files: list[str] = []
+    progress(f"SOURCE READY rows={len(data)} trading_days={data['trade_date'].nunique()}")
 
-    remote = {} if dry_run else remote_status(60)
-    remote_counts = {
-        (str(item.get("trade_date")), item.get("index_code")): int(item.get("row_count", 0))
-        for item in remote.get("data", [])
-    }
+    remote_counts = {}
+    if not dry_run:
+        progress("SERV00 status check started")
+        status = remote_status(60)
+        remote_counts = {(str(x.get("trade_date")), x.get("index_code")): int(x.get("row_count", 0)) for x in status.get("data", [])}
+        progress(f"SERV00 status check done groups={len(remote_counts)}")
 
-    for trade_day, day_frame in data.groupby("trade_date", sort=True):
+    uploaded = 0; skipped = []; processed = []; failures = []; parquet_files = []
+    days = list(data.groupby("trade_date", sort=True))
+    for day_no, (trade_day, day_frame) in enumerate(days, 1):
         day_frame = day_frame.sort_values(["minute_ts", "index_code"])
-        expected = {
-            code: int((day_frame["index_code"] == code).sum()) for code in all_codes
-        }
-        is_complete = all(
-            remote_counts.get((trade_day.isoformat(), code), 0) >= count
-            for code, count in expected.items()
-        )
-        parquet_files.append(_write_day_parquet(trade_day, day_frame))
-        if is_complete and not dry_run:
-            skipped_days.append(trade_day.isoformat())
-            continue
-        repaired_days.append(trade_day.isoformat())
-        records = [_record(row) for _, row in day_frame.iterrows()]
+        progress(f"DAY {day_no}/{len(days)} {trade_day} rows={len(day_frame)}")
+        parquet = write_parquet(trade_day, day_frame); parquet_files.append(parquet)
+        expected = {code: int((day_frame["index_code"] == code).sum()) for code in CONFIG}
+        complete = (not dry_run) and all(remote_counts.get((trade_day.isoformat(), code), 0) >= count for code, count in expected.items())
+        if complete:
+            skipped.append(trade_day.isoformat()); progress(f"  SKIP already complete expected={expected}"); continue
+        processed.append(trade_day.isoformat())
+        records = [record(row) for _, row in day_frame.iterrows()]
+        batches = (len(records) + 399) // 400
         if dry_run:
-            continue
-        for offset in range(0, len(records), 400):
-            batch = records[offset:offset + 400]
+            progress(f"  DRY-RUN would upload rows={len(records)} batches={batches}"); continue
+        for batch_no, offset in enumerate(range(0, len(records), 400), 1):
+            batch = records[offset:offset+400]
+            progress(f"  UPLOAD batch {batch_no}/{batches} rows={len(batch)} started")
+            t0 = time.monotonic()
             try:
-                result = upload_batch(batch)
-                uploaded += int(result.get("upserted", len(batch)))
+                result = upload_batch(batch); count = int(result.get("upserted", len(batch))); uploaded += count
+                progress(f"  UPLOAD batch {batch_no}/{batches} OK upserted={count} elapsed={time.monotonic()-t0:.1f}s total={uploaded}")
             except Exception as exc:
-                upload_failures.append({
-                    "trade_date": trade_day.isoformat(),
-                    "offset": offset,
-                    "rows": len(batch),
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-            if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
+                failures.append({"trade_date": trade_day.isoformat(), "batch": batch_no, "error": f"{type(exc).__name__}: {exc}"})
+                progress(f"  UPLOAD batch {batch_no}/{batches} FAILED {type(exc).__name__}: {exc}")
+            if sleep_seconds > 0: time.sleep(sleep_seconds)
+        progress(f"DAY {trade_day} finished parquet={parquet}")
 
-    state = "SUCCESS"
-    if incomplete or upload_failures:
-        state = "PARTIAL"
-    result = {
-        "state": state,
-        "dry_run": dry_run,
-        "requested_start": start,
-        "requested_end": end,
-        "source_availability": availability,
-        "source_rows": int(len(data)),
-        "uploaded_rows": uploaded,
-        "skipped_complete_days": skipped_days,
-        "processed_days": repaired_days,
-        "upload_failure_count": len(upload_failures),
-        "upload_failures": upload_failures[:100],
-        "parquet_files": parquet_files,
-        "finished_at": datetime.now(TZ).isoformat(timespec="seconds"),
-    }
+    state = "PARTIAL" if failures else "SUCCESS"
+    result = {"state": state, "dry_run": dry_run, "requested_start": start, "requested_end": end,
+              "source_availability": availability, "source_rows": len(data), "uploaded_rows": uploaded,
+              "skipped_complete_days": skipped, "processed_days": processed,
+              "upload_failure_count": len(failures), "upload_failures": failures, "parquet_files": parquet_files,
+              "finished_at": datetime.now(TZ).isoformat(timespec="seconds")}
     status_path = DATA_DIR / "status" / f"index_minute_backfill_{start}_{end}.json"
-    status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    status_path.parent.mkdir(parents=True, exist_ok=True); status_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    progress(f"FINISHED state={state} uploaded={uploaded} skipped_days={len(skipped)} failures={len(failures)}")
     print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
-    if upload_failures and not dry_run:
-        raise RuntimeError(f"{len(upload_failures)} minute batches failed to upload")
+    if failures and not dry_run: raise RuntimeError(f"{len(failures)} batch uploads failed")
     return result
