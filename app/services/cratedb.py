@@ -12,6 +12,19 @@ CRATEDB_PASSWORD = os.getenv("CRATEDB_PASSWORD", "")
 
 SCHEMA_SQL = [
     """
+    CREATE TABLE IF NOT EXISTS doc.index_flow_1m (
+      index_code TEXT NOT NULL, index_symbol TEXT NOT NULL, index_name TEXT NOT NULL,
+      trade_date TIMESTAMP WITH TIME ZONE NOT NULL, minute_ts TIMESTAMP WITH TIME ZONE NOT NULL,
+      close_price DOUBLE PRECISION, change_pct DOUBLE PRECISION,
+      cumulative_volume BIGINT, cumulative_amount DOUBLE PRECISION,
+      minute_volume BIGINT, minute_amount DOUBLE PRECISION,
+      period_price_change DOUBLE PRECISION, source TEXT NOT NULL,
+      received_at TIMESTAMP WITH TIME ZONE,
+      PRIMARY KEY (index_code,minute_ts)
+    ) CLUSTERED INTO 1 SHARDS
+    """,
+
+    """
     CREATE TABLE IF NOT EXISTS doc.sector_flow_1m (
       source TEXT NOT NULL, sector_code TEXT NOT NULL, sector_type TEXT NOT NULL,
       sector_name TEXT NOT NULL, trade_date TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -81,6 +94,22 @@ ON CONFLICT (source,sector_code,trade_date) DO UPDATE SET
  main_compass=excluded.main_compass,main_compass_count=excluded.main_compass_count
 """
 
+
+
+INSERT_INDEX_1M = """
+INSERT INTO doc.index_flow_1m (
+ index_code,index_symbol,index_name,trade_date,minute_ts,close_price,change_pct,
+ cumulative_volume,cumulative_amount,minute_volume,minute_amount,
+ period_price_change,source,received_at
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT (index_code,minute_ts) DO UPDATE SET
+ index_symbol=excluded.index_symbol,index_name=excluded.index_name,
+ trade_date=excluded.trade_date,close_price=excluded.close_price,
+ change_pct=excluded.change_pct,cumulative_volume=excluded.cumulative_volume,
+ cumulative_amount=excluded.cumulative_amount,minute_volume=excluded.minute_volume,
+ minute_amount=excluded.minute_amount,period_price_change=excluded.period_price_change,
+ source=excluded.source,received_at=excluded.received_at
+"""
 
 def _endpoint() -> str:
     if not CRATEDB_URL:
@@ -212,3 +241,34 @@ def counts(trade_date: str) -> dict[str, int]:
         result = sql(f"SELECT count(*) FROM doc.{table} WHERE trade_date = ?", [trade_date])
         output[table] = int(result["rows"][0][0])
     return output
+
+
+
+def upload_index_1m(records: Iterable[dict[str, Any]], batch_size: int = 400) -> int:
+    batch: list[list[Any]] = []
+    total = 0
+    for item in records:
+        batch.append([
+            item["index_code"], item["index_symbol"], item["index_name"],
+            item["trade_date"], item["minute_ts"], item.get("close_price"),
+            item.get("change_pct"), item.get("cumulative_volume"),
+            item.get("cumulative_amount"), item.get("minute_volume"),
+            item.get("minute_amount"), item.get("period_price_change"),
+            item.get("source", "sina"), item.get("received_at") or item["minute_ts"],
+        ])
+        if len(batch) >= batch_size:
+            result = sql(INSERT_INDEX_1M, bulk_args=batch)
+            total += len(result.get("results", []))
+            batch.clear()
+    if batch:
+        result = sql(INSERT_INDEX_1M, bulk_args=batch)
+        total += len(result.get("results", []))
+    return total
+
+
+def index_1m_count(trade_date: str) -> int:
+    result = sql(
+        "SELECT count(*) FROM doc.index_flow_1m WHERE trade_date = ?",
+        [trade_date],
+    )
+    return int(result["rows"][0][0])

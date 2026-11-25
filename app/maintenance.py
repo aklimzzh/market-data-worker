@@ -11,6 +11,7 @@ from .fundflow_backfill import run as fundflow_backfill
 from .services.etf_index_repair import repair_etf_exchange, repair_indexes
 from .services.serv00_audit import audit_trade_date
 from .services.index_minute import retention as index_retention
+from .services.cratedb import ensure_schema, index_1m_count, upload_index_1m
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -31,6 +32,35 @@ def prune_parquet(keep: int = 5) -> list[str]:
             removed.append(str(path))
     return removed
 
+
+
+def archive_index_1m(trade_date: str) -> dict:
+    import pandas as pd
+
+    day = date.fromisoformat(trade_date)
+    parquet = DATA_DIR / "index_archive" / day.strftime("%Y/%m") / f"{trade_date}.parquet"
+    if not parquet.exists():
+        raise FileNotFoundError(f"index 1m parquet missing: {parquet}")
+    frame = pd.read_parquet(parquet)
+    if frame.empty:
+        raise RuntimeError(f"index 1m parquet is empty: {parquet}")
+    frame = frame.drop_duplicates(["index_code", "minute_ts"], keep="last")
+    records = frame.where(frame.notna(), None).to_dict(orient="records")
+    ensure_schema()
+    upserted = upload_index_1m(records)
+    crate_rows = index_1m_count(trade_date)
+    expected_rows = len(records)
+    if crate_rows < expected_rows:
+        raise RuntimeError(
+            f"CrateDB index_flow_1m incomplete: expected={expected_rows} actual={crate_rows}"
+        )
+    return {
+        "ok": True,
+        "parquet": str(parquet),
+        "source_rows": expected_rows,
+        "crate_upserted": upserted,
+        "crate_rows": crate_rows,
+    }
 
 def run(trade_date: str, sleep_seconds: float = 0.5, refresh_calendar: bool = False) -> None:
     status_path = DATA_DIR / "status" / f"maintenance_{trade_date}.json"
@@ -83,6 +113,8 @@ def run(trade_date: str, sleep_seconds: float = 0.5, refresh_calendar: bool = Fa
             "removed": removed,
         }
 
+        # Archive must succeed before Serv00 retention is allowed.
+        status["steps"]["index_1m_archive"] = archive_index_1m(trade_date)
         status["steps"]["index_1m_retention"] = index_retention()
 
         if refresh_calendar:
