@@ -32,7 +32,6 @@ def main():
     indexes.add_argument("--end")
     indexes.add_argument("--sleep", type=float, default=1.0)
 
-    # Index 1-minute historical backfill
     minute_indexes = sub.add_parser("index-minute-backfill")
     minute_indexes.add_argument("--start", required=True)
     minute_indexes.add_argument("--end", required=True)
@@ -42,4 +41,57 @@ def main():
     reconcile = sub.add_parser("reconcile")
     reconcile.add_argument(
         "--scope",
-        choices
+        choices=("sector", "index", "all"),
+        default="all",
+    )
+    reconcile.add_argument("--final", action="store_true")
+
+    maintain = sub.add_parser("maintenance")
+    maintain.add_argument("--date", required=True)
+    maintain.add_argument("--sleep", type=float, default=0.5)
+    maintain.add_argument("--refresh-calendar", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.cmd == "collector":
+        collector()
+
+    elif args.cmd == "calendar-update":
+        calendar_update()
+
+    elif args.cmd == "fundflow-backfill":
+        fundflow_backfill(args.date, args.sleep)
+
+    elif args.cmd == "fundflow-daily-backfill":
+        fundflow_daily_backfill(args.days, args.sleep)
+
+    elif args.cmd == "index-backfill":
+        start = args.date or args.start
+        end = args.date or args.end
+
+        if not end:
+            parser.error("index-backfill --start requires --end")
+
+        index_backfill(start, end, args.sleep)
+
+    elif args.cmd == "index-minute-backfill":
+        index_minute_backfill(
+            args.start,
+            args.end,
+            args.sleep,
+            args.dry_run,
+        )
+
+    elif args.cmd == "reconcile":
+        reconciliation(args.scope, args.final)
+
+    elif args.cmd == "maintenance":
+        maintenance(
+            args.date,
+            args.sleep,
+            args.refresh_calendar,
+        )
+
+
+if __name__ == "__main__":
+    main()
