@@ -14,7 +14,8 @@ from .config import (
     SERV00_INGEST_URL,
     SINA_INTERVAL,
 )
-from .services.intraday_repair import maybe_start, repair_now
+from .services.intraday_repair import maybe_start as start_sector_repair, repair_now
+from .services.index_rolling_repair import maybe_start as start_index_repair, repair_now as repair_indexes_history
 from .services.daily_finalize import finalize_parquet
 from .services.local_store import append_csv, save_pending, write_json_atomic
 from .services.serv00 import post_batch
@@ -108,7 +109,7 @@ def _status_base(final_checks: list[str]) -> dict:
 def run():
     session = requests.Session()
     last_bucket = None
-    last_repair_check = 0.0
+    repair_triggers: set[str] = set()
     final_checks: list[str] = []
     pending_flushed = 0
     finalization_result = None
@@ -126,11 +127,13 @@ def run():
             if final_1540_done and finalization_result is None:
                 try:
                     print("[FINALIZE] final repair started", flush=True)
-                    repair_result = repair_now(now, sleep_seconds=0.25)
+                    repair_result = repair_now(now, sleep_seconds=0.25, num=300, mode="final")
+                    index_history_result = repair_indexes_history(now, minutes=None, mode="final")
                     parquet_result = finalize_parquet(now.date())
                     index_parquet_result = finalize_indexes(now.date())
                     finalization_result = {
                         "repair": repair_result,
+                        "index_history_repair": index_history_result,
                         "parquet": parquet_result,
                         "index": index_parquet_result,
                     }
@@ -178,13 +181,48 @@ def run():
             continue
 
         market_phase = phase(current_time)
-        monotonic_now = time.monotonic()
-        if (
-            market_phase in {"continuous_am", "continuous_pm"}
-            and monotonic_now - last_repair_check >= 600
-        ):
-            maybe_start(now, minimum_gap=1, sleep_seconds=0.5, safety_delay=5)
-            last_repair_check = monotonic_now
+        minute_key = now.strftime("%Y-%m-%dT%H:%M")
+        hhmm = current_time.strftime("%H:%M")
+
+        def trigger(name: str, callback) -> None:
+            key = f"{minute_key}:{name}"
+            if key not in repair_triggers:
+                if callback():
+                    repair_triggers.add(key)
+
+        # Index: 09:41..11:21 and 13:11..15:01, every 10 minutes.
+        if ((current_time.hour == 9 and current_time.minute >= 41 and current_time.minute % 10 == 1)
+                or (current_time.hour == 10 and current_time.minute % 10 == 1)
+                or (current_time.hour == 11 and current_time.minute <= 21 and current_time.minute % 10 == 1)
+                or (current_time.hour == 13 and current_time.minute >= 11 and current_time.minute % 10 == 1)
+                or (current_time.hour == 14 and current_time.minute % 10 == 1)
+                or (current_time.hour == 15 and current_time.minute == 1)):
+            trigger("index_rolling", lambda: start_index_repair(now, minutes=30, mode="rolling"))
+
+        # Industry: 09:42..11:32 and 13:12..15:02, every 10 minutes.
+        if ((current_time.hour == 9 and current_time.minute >= 42 and current_time.minute % 10 == 2)
+                or (current_time.hour == 10 and current_time.minute % 10 == 2)
+                or (current_time.hour == 11 and current_time.minute <= 32 and current_time.minute % 10 == 2)
+                or (current_time.hour == 13 and current_time.minute >= 12 and current_time.minute % 10 == 2)
+                or (current_time.hour == 14 and current_time.minute % 10 == 2)
+                or (current_time.hour == 15 and current_time.minute == 2)):
+            trigger("industry_rolling", lambda: start_sector_repair(now, sector_type="industry", num=30, mode="rolling"))
+
+        # Concept: 09:45, then every 20 minutes through 11:25; 13:15..14:55.
+        concept_due = (
+            (current_time.hour == 9 and current_time.minute == 45)
+            or (current_time.hour in {10, 11} and current_time.minute in {5, 25, 45} and not (current_time.hour == 11 and current_time.minute > 25))
+            or (current_time.hour in {13, 14} and current_time.minute in {15, 35, 55})
+        )
+        if concept_due:
+            trigger("concept_rolling", lambda: start_sector_repair(now, sector_type="concept", num=30, mode="rolling"))
+
+        if hhmm == "11:35":
+            trigger("industry_morning_full", lambda: start_sector_repair(now, sector_type="industry", num=300, mode="morning_full"))
+        if hhmm == "11:40":
+            trigger("index_morning_full", lambda: start_index_repair(now, minutes=None, morning_only=True, mode="morning_full"))
+        if hhmm == "11:45":
+            trigger("concept_morning_full", lambda: start_sector_repair(now, sector_type="concept", num=300, mode="morning_full"))
 
         if market_phase == "idle":
             idle_phase = "post_close_wait" if dt_time(15, 12) < current_time < dt_time(15, 40) else "idle"

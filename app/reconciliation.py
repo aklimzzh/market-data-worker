@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 from .services.intraday_repair import repair_now
 from .services.daily_finalize import finalize_parquet
 from .services.index_minute import collect,finalize
+from .services.index_rolling_repair import repair_now as repair_index_history
 TZ=ZoneInfo("Asia/Shanghai")
 def run(scope="all",final=False):
  now=datetime.now(TZ);result={"state":"RUNNING","scope":scope,"final":final,"started_at":now.isoformat(timespec="seconds")}

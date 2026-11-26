@@ -13,7 +13,6 @@ from ..sources.sina_history import sector_catalog
 from .local_store import append_csv, write_json_atomic
 
 TZ = ZoneInfo("Asia/Shanghai")
-EXPECTED_SECTORS = 229
 HISTORY_URL = (
     "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
     "MoneyFlow.ssx_bkzj_fszs"
@@ -27,8 +26,8 @@ _LOCK = threading.Lock()
 _RUNNING = False
 
 
-def _status_path(day: date):
-    return DATA_DIR / "status" / f"intraday_repair_{day.isoformat()}.json"
+def _status_path(day: date, sector_type: str):
+    return DATA_DIR / "status" / f"intraday_repair_{sector_type}_{day.isoformat()}.json"
 
 
 def _csv_path(day: date):
@@ -43,8 +42,9 @@ def _phase(ticktime: str) -> str | None:
     return None
 
 
-def _bankuai(code: str) -> str:
-    return code if "/" in code else f"0/{code}"
+def _bankuai(sector: dict) -> str:
+    prefix = "0" if sector["sector_type"] == "industry" else "1"
+    return f"{prefix}/{sector['sector_code']}"
 
 
 def _fetch_one(sector: dict, day: date, num: int) -> tuple[list[dict], str | None]:
@@ -56,7 +56,7 @@ def _fetch_one(sector: dict, day: date, num: int) -> tuple[list[dict], str | Non
                 params={
                     "page": "1",
                     "num": str(num),
-                    "bankuai": _bankuai(sector["sector_code"]),
+                    "bankuai": _bankuai(sector),
                     "sort": "time",
                 },
                 headers=HEADERS,
@@ -135,11 +135,11 @@ def _upload(records: list[dict], batch_size: int = 1000) -> int:
     return total
 
 
-def repair_now(
+def repair_type_now(
     now: datetime,
-    sleep_seconds: float = 0.0,
-    num: int = 300,
-    mode: str = "final",
+    sector_type: str,
+    num: int = 30,
+    mode: str = "rolling",
 ) -> dict:
     day = now.astimezone(TZ).date()
     started = datetime.now(TZ)
@@ -150,10 +150,14 @@ def repair_now(
         "trade_date": day.isoformat(),
         "started_at": started.isoformat(timespec="seconds"),
     }
-    write_json_atomic(_status_path(day), status)
-    sectors = sector_catalog(requests.Session())
-    if len(sectors) != EXPECTED_SECTORS:
-        raise RuntimeError(f"expected {EXPECTED_SECTORS} sectors, got {len(sectors)}")
+    write_json_atomic(_status_path(day, sector_type), status)
+    catalog = sector_catalog(requests.Session())
+    sectors = [item for item in catalog if item["sector_type"] == sector_type]
+    expected = len(sectors)
+    if expected <= 0:
+        raise RuntimeError(f"empty catalog for {sector_type}")
+    status["sector_type"] = sector_type
+    status["sectors_requested"] = expected
 
     records: list[dict] = []
     failures: list[dict] = []
@@ -174,9 +178,9 @@ def repair_now(
                         latest_by_sector.append(max(row["minute_ts"] for row in rows))
             except Exception as exc:
                 failures.append({"sector": sector["sector_code"], "error": str(exc)})
-            if completed % 25 == 0 or completed == EXPECTED_SECTORS:
+            if completed % 25 == 0 or completed == expected:
                 print(
-                    f"[SECTOR-REPAIR] fetched={completed}/{EXPECTED_SECTORS} "
+                    f"[SECTOR-REPAIR] fetched={completed}/{expected} "
                     f"rows={len(records)} failures={len(failures)}",
                     flush=True,
                 )
@@ -193,8 +197,8 @@ def repair_now(
 
     status.update({
         "state": "SUCCESS" if not failures else "PARTIAL",
-        "sectors_requested": EXPECTED_SECTORS,
-        "sectors_success": EXPECTED_SECTORS - len(failures),
+        "sectors_requested": expected,
+        "sectors_success": expected - len(failures),
         "sectors_failed": len(failures),
         "historical_rows": len(records),
         "rows_upserted": upserted,
@@ -205,7 +209,7 @@ def repair_now(
         "duration_seconds": round((datetime.now(TZ) - started).total_seconds(), 1),
         "finished_at": datetime.now(TZ).isoformat(timespec="seconds"),
     })
-    write_json_atomic(_status_path(day), status)
+    write_json_atomic(_status_path(day, sector_type), status)
     print(
         f"[SECTOR-REPAIR] finished mode={mode} rows={len(records)} "
         f"upserted={upserted} failures={len(failures)}",
@@ -214,10 +218,10 @@ def repair_now(
     return status
 
 
-def _background(now: datetime, num: int, mode: str) -> None:
+def _background(now: datetime, sector_type: str, num: int, mode: str) -> None:
     global _RUNNING
     try:
-        repair_now(now, num=num, mode=mode)
+        repair_type_now(now, sector_type, num=num, mode=mode)
     except Exception as exc:
         payload = {
             "state": "FAILED",
@@ -226,14 +230,14 @@ def _background(now: datetime, num: int, mode: str) -> None:
             "error": f"{type(exc).__name__}: {exc}",
             "finished_at": datetime.now(TZ).isoformat(timespec="seconds"),
         }
-        write_json_atomic(_status_path(now.astimezone(TZ).date()), payload)
+        write_json_atomic(_status_path(now.astimezone(TZ).date(), sector_type), payload)
         print(f"[SECTOR-REPAIR] failed: {payload['error']}", flush=True)
     finally:
         with _LOCK:
             _RUNNING = False
 
 
-def maybe_start(now: datetime, num: int = 30, mode: str = "rolling", **_ignored) -> bool:
+def maybe_start(now: datetime, sector_type: str = "industry", num: int = 30, mode: str = "rolling", **_ignored) -> bool:
     global _RUNNING
     if not SERV00_INGEST_URL:
         return False
@@ -244,9 +248,16 @@ def maybe_start(now: datetime, num: int = 30, mode: str = "rolling", **_ignored)
         _RUNNING = True
     threading.Thread(
         target=_background,
-        args=(now, num, mode),
-        name=f"sector-repair-{mode}",
+        args=(now, sector_type, num, mode),
+        name=f"sector-repair-{sector_type}-{mode}",
         daemon=True,
     ).start()
-    print(f"[SECTOR-REPAIR] started mode={mode} num={num}", flush=True)
+    print(f"[SECTOR-REPAIR:{sector_type}] started mode={mode} num={num}", flush=True)
     return True
+
+
+def repair_now(now: datetime, sleep_seconds: float = 0.0, num: int = 300, mode: str = "final") -> dict:
+    return {
+        "industry": repair_type_now(now, "industry", num=num, mode=mode),
+        "concept": repair_type_now(now, "concept", num=num, mode=mode),
+    }
