@@ -1,50 +1,41 @@
 from __future__ import annotations
 
-import csv
 import threading
 import time
-from collections import defaultdict
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import requests
 
 from ..config import DATA_DIR, SERV00_API_TOKEN, SERV00_INGEST_URL
-from ..sources.sina_history import fetch_sector_day, sector_catalog
+from ..sources.sina_history import sector_catalog
 from .local_store import append_csv, write_json_atomic
-from .serv00 import post_batch
 
 TZ = ZoneInfo("Asia/Shanghai")
+EXPECTED_SECTORS = 229
+HISTORY_URL = (
+    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    "MoneyFlow.ssx_bkzj_fszs"
+)
+HEADERS = {
+    "Referer": "https://vip.stock.finance.sina.com.cn/",
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "*/*",
+}
 _LOCK = threading.Lock()
 _RUNNING = False
-EXPECTED_SECTORS = 229
 
 
-def _csv_path(trade_date: date) -> Path:
-    return DATA_DIR / "raw" / trade_date.strftime("%Y/%m") / f"{trade_date.isoformat()}.csv"
+def _status_path(day: date):
+    return DATA_DIR / "status" / f"intraday_repair_{day.isoformat()}.json"
 
 
-def _existing_complete_minutes(trade_date: date) -> set[str]:
-    """A minute exists only when all 229 unique sectors were written."""
-    path = _csv_path(trade_date)
-    if not path.exists():
-        return set()
-    sectors_by_minute: dict[str, set[str]] = defaultdict(set)
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            minute = row.get("minute_ts")
-            sector = row.get("sector_code")
-            if minute and sector:
-                sectors_by_minute[minute].add(sector)
-    return {
-        minute
-        for minute, sectors in sectors_by_minute.items()
-        if len(sectors) == EXPECTED_SECTORS
-    }
+def _csv_path(day: date):
+    return DATA_DIR / "raw" / day.strftime("%Y/%m") / f"{day.isoformat()}.csv"
 
 
-def _phase_for_tick(ticktime: str) -> str | None:
+def _phase(ticktime: str) -> str | None:
     if "09:30:00" <= ticktime <= "11:30:00":
         return "continuous_am"
     if "13:00:00" <= ticktime <= "15:00:00":
@@ -52,196 +43,210 @@ def _phase_for_tick(ticktime: str) -> str | None:
     return None
 
 
-def expected_trading_minutes(trade_date: date, cutoff: datetime | None = None) -> set[str]:
-    cutoff_value = None
-    if cutoff is not None:
-        cutoff_value = cutoff.astimezone(TZ).replace(second=0, microsecond=0)
-    expected: set[str] = set()
-    for sh, sm, eh, em in ((9, 30, 11, 30), (13, 1, 15, 0)):
-        cursor = datetime(trade_date.year, trade_date.month, trade_date.day, sh, sm, tzinfo=TZ)
-        end = datetime(trade_date.year, trade_date.month, trade_date.day, eh, em, tzinfo=TZ)
-        while cursor <= end:
-            if cutoff_value is None or cursor < cutoff_value:
-                expected.add(cursor.isoformat(timespec="seconds"))
-            cursor += timedelta(minutes=1)
-    return expected
+def _bankuai(code: str) -> str:
+    return code if "/" in code else f"0/{code}"
 
 
-def missing_minutes(trade_date: date, now: datetime, safety_delay: int) -> tuple[set[str], set[str], datetime]:
-    safe_cutoff = now.astimezone(TZ).replace(second=0, microsecond=0) - timedelta(minutes=safety_delay)
-    expected = expected_trading_minutes(trade_date, safe_cutoff)
-    existing = _existing_complete_minutes(trade_date)
-    return expected - existing, expected, safe_cutoff
+def _fetch_one(sector: dict, day: date, num: int) -> tuple[list[dict], str | None]:
+    error = None
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                HISTORY_URL,
+                params={
+                    "page": "1",
+                    "num": str(num),
+                    "bankuai": _bankuai(sector["sector_code"]),
+                    "sort": "time",
+                },
+                headers=HEADERS,
+                timeout=(5, 20),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            points = payload[1] if isinstance(payload, list) and len(payload) >= 2 else []
+            records = []
+            for point in points:
+                if point.get("opendate") != day.isoformat():
+                    continue
+                phase = _phase(str(point.get("ticktime", "")))
+                if phase is None:
+                    continue
+                minute = datetime.fromisoformat(
+                    f"{point['opendate']}T{point['ticktime']}"
+                ).replace(tzinfo=TZ)
+                records.append({
+                    "trade_date": day.isoformat(),
+                    "minute_ts": minute.isoformat(timespec="seconds"),
+                    "source": "sina",
+                    "market_phase": phase,
+                    "sector_type": sector["sector_type"],
+                    "sector_code": sector["sector_code"],
+                    "sector_name": sector["sector_name"],
+                    "avg_price": point.get("avg_price"),
+                    "pct_change": point.get("avg_changeratio"),
+                    "turnover": None,
+                    "in_amount": point.get("inamount"),
+                    "out_amount": point.get("outamount"),
+                    "net_amount": point.get("netamount"),
+                    "net_ratio": point.get("ratioamount"),
+                    "leader_code": None,
+                    "leader_name": None,
+                    "leader_price": None,
+                    "leader_pct_change": None,
+                    "leader_net_ratio": None,
+                })
+            return records, None
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            if attempt == 0:
+                time.sleep(1)
+    return [], error
 
 
-def _record(sector: dict, point: dict) -> dict:
-    minute = datetime.fromisoformat(f"{point['opendate']}T{point['ticktime']}").replace(tzinfo=TZ)
-    return {
-        "trade_date": point["opendate"],
-        "minute_ts": minute.isoformat(timespec="seconds"),
-        "source": "sina",
-        "market_phase": _phase_for_tick(point["ticktime"]) or "backfill",
-        "sector_type": sector["sector_type"],
-        "sector_code": sector["sector_code"],
-        "sector_name": sector["sector_name"],
-        "avg_price": point.get("avg_price"),
-        "pct_change": point.get("avg_changeratio"),
-        "turnover": None,
-        "in_amount": point.get("inamount"),
-        "out_amount": point.get("outamount"),
-        "net_amount": point.get("netamount"),
-        "net_ratio": point.get("ratioamount"),
-        "leader_code": None,
-        "leader_name": None,
-        "leader_price": None,
-        "leader_pct_change": None,
-        "leader_net_ratio": None,
-    }
+def _repair_url() -> str:
+    if not SERV00_INGEST_URL:
+        raise RuntimeError("SERV00_INGEST_URL is empty")
+    base = SERV00_INGEST_URL.split("/api/v1/fundflow/import")[0].split("/api/fundflow/ingest")[0].rstrip("/")
+    return base + "/api/v1/fundflow/repair"
 
 
-def _write_status(trade_date: date, payload: dict) -> None:
-    write_json_atomic(DATA_DIR / "status" / f"intraday_repair_{trade_date.isoformat()}.json", payload)
+def _upload(records: list[dict], batch_size: int = 1000) -> int:
+    total = 0
+    url = _repair_url()
+    for offset in range(0, len(records), batch_size):
+        batch = records[offset:offset + batch_size]
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {SERV00_API_TOKEN}"},
+            json={"records": batch},
+            timeout=(10, 120),
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("success"):
+            raise RuntimeError(f"Serv00 repair failed: {result}")
+        total += int(result.get("upserted", len(batch)))
+        print(
+            f"[SECTOR-REPAIR] upload {offset + 1}-{offset + len(batch)} "
+            f"of {len(records)} total={total}",
+            flush=True,
+        )
+    return total
 
 
-def _repair(
-    trade_date: date,
-    requested_at: datetime,
-    candidate_minutes: set[str],
-    safe_cutoff: datetime,
-    sleep_seconds: float,
-    mode: str,
+def repair_now(
+    now: datetime,
+    sleep_seconds: float = 0.0,
+    num: int = 300,
+    mode: str = "final",
 ) -> dict:
+    day = now.astimezone(TZ).date()
     started = datetime.now(TZ)
     status = {
         "state": "RUNNING",
         "mode": mode,
-        "trade_date": trade_date.isoformat(),
+        "num": num,
+        "trade_date": day.isoformat(),
         "started_at": started.isoformat(timespec="seconds"),
-        "started_from": requested_at.replace(second=0, microsecond=0).isoformat(timespec="seconds"),
-        "safe_cutoff": safe_cutoff.isoformat(timespec="seconds"),
-        "candidate_minutes": sorted(candidate_minutes),
     }
-    _write_status(trade_date, status)
-    if not candidate_minutes:
-        status.update({
-            "state": "SUCCESS",
-            "missing_minutes": 0,
-            "repaired_minutes": [],
-            "skipped_minutes": [],
-            "finished_at": datetime.now(TZ).isoformat(timespec="seconds"),
-        })
-        _write_status(trade_date, status)
-        return status
-
-    session = requests.Session()
-    sectors = sector_catalog(session)
+    write_json_atomic(_status_path(day), status)
+    sectors = sector_catalog(requests.Session())
     if len(sectors) != EXPECTED_SECTORS:
         raise RuntimeError(f"expected {EXPECTED_SECTORS} sectors, got {len(sectors)}")
 
-    grouped: dict[str, list[dict]] = defaultdict(list)
+    records: list[dict] = []
     failures: list[dict] = []
-    for index, sector in enumerate(sectors, start=1):
-        try:
-            for point in fetch_sector_day(session, sector, trade_date):
-                if _phase_for_tick(point["ticktime"]) is None:
-                    continue
-                record = _record(sector, point)
-                if record["minute_ts"] in candidate_minutes:
-                    grouped[record["minute_ts"]].append(record)
-        except Exception as exc:
-            failures.append({"sector": sector["sector_code"], "error": str(exc)})
-        if index % 25 == 0 or index == EXPECTED_SECTORS:
-            print(f"[INTRADAY-REPAIR] fetched={index}/{EXPECTED_SECTORS} failures={len(failures)}", flush=True)
-        time.sleep(sleep_seconds)
-    if failures:
-        raise RuntimeError(f"history fetch failed for {len(failures)} sectors")
+    latest_by_sector: list[str] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_one, sector, day, num): sector for sector in sectors}
+        completed = 0
+        for future in as_completed(futures):
+            sector = futures[future]
+            completed += 1
+            try:
+                rows, error = future.result()
+                if error:
+                    failures.append({"sector": sector["sector_code"], "error": error})
+                else:
+                    records.extend(rows)
+                    if rows:
+                        latest_by_sector.append(max(row["minute_ts"] for row in rows))
+            except Exception as exc:
+                failures.append({"sector": sector["sector_code"], "error": str(exc)})
+            if completed % 25 == 0 or completed == EXPECTED_SECTORS:
+                print(
+                    f"[SECTOR-REPAIR] fetched={completed}/{EXPECTED_SECTORS} "
+                    f"rows={len(records)} failures={len(failures)}",
+                    flush=True,
+                )
 
-    repaired: list[str] = []
-    skipped: list[dict] = []
-    csv_path = _csv_path(trade_date)
-    for minute in sorted(candidate_minutes):
-        unique = {item["sector_code"]: item for item in grouped.get(minute, [])}
-        if len(unique) != EXPECTED_SECTORS:
-            skipped.append({"minute_ts": minute, "records": len(unique)})
-            continue
-        records = list(unique.values())
-        payload = {
-            "schema_version": 1,
-            "trade_date": trade_date.isoformat(),
-            "minute_ts": minute,
-            "market_phase": records[0]["market_phase"],
-            "records": records,
-        }
-        post_batch(SERV00_INGEST_URL, SERV00_API_TOKEN, payload)
-        append_csv(csv_path, records)
-        repaired.append(minute)
-        print(f"[INTRADAY-REPAIR] repaired {minute}", flush=True)
+    # Sparse history is expected. Upsert every authoritative row returned by Sina.
+    unique = {
+        (row["source"], row["sector_code"], row["minute_ts"]): row
+        for row in records
+    }
+    records = sorted(unique.values(), key=lambda row: (row["minute_ts"], row["sector_code"]))
+    upserted = _upload(records) if records else 0
+    if records:
+        append_csv(_csv_path(day), records)
 
-    remaining = sorted(expected_trading_minutes(trade_date) - _existing_complete_minutes(trade_date))
     status.update({
-        "state": "SUCCESS" if not skipped and not remaining else "PARTIAL",
-        "missing_minutes": len(candidate_minutes),
-        "repaired_minutes": repaired,
-        "skipped_minutes": skipped,
-        "remaining_missing_minutes": remaining,
+        "state": "SUCCESS" if not failures else "PARTIAL",
+        "sectors_requested": EXPECTED_SECTORS,
+        "sectors_success": EXPECTED_SECTORS - len(failures),
+        "sectors_failed": len(failures),
+        "historical_rows": len(records),
+        "rows_upserted": upserted,
+        "earliest_tick": min((row["minute_ts"] for row in records), default=None),
+        "latest_tick_min": min(latest_by_sector, default=None),
+        "latest_tick_max": max(latest_by_sector, default=None),
+        "failures": failures[:50],
+        "duration_seconds": round((datetime.now(TZ) - started).total_seconds(), 1),
         "finished_at": datetime.now(TZ).isoformat(timespec="seconds"),
     })
-    _write_status(trade_date, status)
+    write_json_atomic(_status_path(day), status)
+    print(
+        f"[SECTOR-REPAIR] finished mode={mode} rows={len(records)} "
+        f"upserted={upserted} failures={len(failures)}",
+        flush=True,
+    )
     return status
 
 
-def _background_worker(*args) -> None:
+def _background(now: datetime, num: int, mode: str) -> None:
     global _RUNNING
-    trade_date = args[0]
     try:
-        _repair(*args)
+        repair_now(now, num=num, mode=mode)
     except Exception as exc:
         payload = {
             "state": "FAILED",
-            "mode": "intraday",
-            "trade_date": trade_date.isoformat(),
+            "mode": mode,
+            "trade_date": now.astimezone(TZ).date().isoformat(),
             "error": f"{type(exc).__name__}: {exc}",
             "finished_at": datetime.now(TZ).isoformat(timespec="seconds"),
         }
-        _write_status(trade_date, payload)
-        print(f"[INTRADAY-REPAIR] failed: {payload['error']}", flush=True)
+        write_json_atomic(_status_path(now.astimezone(TZ).date()), payload)
+        print(f"[SECTOR-REPAIR] failed: {payload['error']}", flush=True)
     finally:
         with _LOCK:
             _RUNNING = False
 
 
-def maybe_start(now: datetime, minimum_gap: int = 1, sleep_seconds: float = 0.5, safety_delay: int = 5) -> bool:
+def maybe_start(now: datetime, num: int = 30, mode: str = "rolling", **_ignored) -> bool:
     global _RUNNING
     if not SERV00_INGEST_URL:
         return False
-    trade_date = now.astimezone(TZ).date()
-    missing, expected, safe_cutoff = missing_minutes(trade_date, now, safety_delay)
-    if len(missing) < minimum_gap:
-        return False
     with _LOCK:
         if _RUNNING:
+            print(f"[SECTOR-REPAIR] skip mode={mode}; previous run active", flush=True)
             return False
         _RUNNING = True
-    thread = threading.Thread(
-        target=_background_worker,
-        args=(trade_date, now, missing, safe_cutoff, sleep_seconds, "intraday"),
-        name="intraday-repair",
+    threading.Thread(
+        target=_background,
+        args=(now, num, mode),
+        name=f"sector-repair-{mode}",
         daemon=True,
-    )
-    thread.start()
-    print(f"[INTRADAY-REPAIR] started missing={len(missing)} expected={len(expected)} safety_delay={safety_delay}min", flush=True)
+    ).start()
+    print(f"[SECTOR-REPAIR] started mode={mode} num={num}", flush=True)
     return True
-
-
-def repair_now(now: datetime, sleep_seconds: float = 0.25) -> dict:
-    """Blocking final repair for every incomplete official trading minute."""
-    if not SERV00_INGEST_URL:
-        raise RuntimeError("SERV00_INGEST_URL is empty")
-    trade_date = now.astimezone(TZ).date()
-    expected = expected_trading_minutes(trade_date)
-    missing = expected - _existing_complete_minutes(trade_date)
-    print(f"[FINAL-REPAIR] missing_before={len(missing)} expected={len(expected)}", flush=True)
-    result = _repair(trade_date, now, missing, now.astimezone(TZ), sleep_seconds, "final")
-    result["expected_minutes"] = len(expected)
-    result["complete_minutes"] = len(_existing_complete_minutes(trade_date))
-    return result

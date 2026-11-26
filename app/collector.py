@@ -104,7 +104,7 @@ def _status_base(final_checks: list[str]) -> dict:
 def run():
     session = requests.Session()
     last_bucket = None
-    last_repair_check = 0.0
+    repair_triggers: set[str] = set()
     final_checks: list[str] = []
     pending_flushed = 0
     finalization_result = None
@@ -119,37 +119,8 @@ def run():
         # remains at 15:45.
         if dt_time(15, 40) < current_time:
             final_1540_done = any(value.endswith("T15:40:00+08:00") for value in final_checks)
-            if final_1540_done and finalization_result is None:
-                try:
-                    print("[FINALIZE] final repair started", flush=True)
-                    repair_result = repair_now(now, sleep_seconds=0.25)
-                    parquet_result = finalize_parquet(now.date())
-                    index_parquet_result = finalize_indexes(now.date())
-                    finalization_result = {
-                        "repair": repair_result,
-                        "parquet": parquet_result,
-                        "index": index_parquet_result,
-                    }
-                    print(f"[FINALIZE] completed complete={parquet_result.get('complete')}", flush=True)
-                except Exception as exc:
-                    finalization_result = {
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "completed_at": datetime.now(TZ).isoformat(timespec="seconds"),
-                    }
-                    print(f"[FINALIZE] failed: {finalization_result['error']}", flush=True)
             pending_flushed += retry_pending()
             remaining = pending_count()
-            if final_1540_done and finalization_result is not None and remaining == 0:
-                write_json_atomic(status_path, {
-                    "state": "STOPPED",
-                    "stopped_at": now.isoformat(timespec="seconds"),
-                    "reason": "post-close final repair and parquet completed",
-                    "final_checks": final_checks,
-                    "finalization": finalization_result,
-                    "pending_flushed": pending_flushed,
-                    "pending_files": 0,
-                })
-                return
             if current_time >= FINAL_RETRY_DEADLINE:
                 write_json_atomic(status_path, {
                     "state": "STOPPED",
@@ -174,13 +145,26 @@ def run():
             continue
 
         market_phase = phase(current_time)
-        monotonic_now = time.monotonic()
-        if (
-            market_phase in {"continuous_am", "continuous_pm"}
-            and monotonic_now - last_repair_check >= 600
-        ):
-            maybe_start(now, minimum_gap=1, sleep_seconds=0.5, safety_delay=5)
-            last_repair_check = monotonic_now
+        bucket_key = now.replace(second=0, microsecond=0).isoformat(timespec="minutes")
+        rolling_due = (
+            current_time.second < 10
+            and current_time.minute % 10 == 0
+            and (
+                dt_time(9, 40) <= current_time <= dt_time(11, 30)
+                or dt_time(13, 10) <= current_time <= dt_time(15, 0)
+            )
+        )
+        midday_due = (
+            current_time.second < 10
+            and current_time.hour == 11
+            and current_time.minute == 45
+        )
+        if rolling_due and bucket_key not in repair_triggers:
+            if maybe_start(now, num=30, mode="rolling"):
+                repair_triggers.add(bucket_key)
+        if midday_due and bucket_key not in repair_triggers:
+            if maybe_start(now, num=300, mode="midday"):
+                repair_triggers.add(bucket_key)
 
         if market_phase == "idle":
             idle_phase = "post_close_wait" if dt_time(15, 12) < current_time < dt_time(15, 40) else "idle"
