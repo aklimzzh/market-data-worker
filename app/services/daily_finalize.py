@@ -56,7 +56,7 @@ def finalize_parquet(trade_date: date) -> dict:
     if not csv_path.exists():
         raise FileNotFoundError(csv_path)
 
-    raw = pd.read_csv(csv_path, dtype={"sector_code": str})
+    raw = pd.read_csv(csv_path, dtype={"sector_code": str},low_memory=False)
     if raw.empty:
         raise RuntimeError(f"empty CSV: {csv_path}")
 
