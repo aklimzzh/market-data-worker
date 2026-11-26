@@ -50,6 +50,7 @@ def main():
     maintain.add_argument("--date", required=True)
     maintain.add_argument("--sleep", type=float, default=0.5)
     maintain.add_argument("--refresh-calendar", action="store_true")
+    maintain.add_argument("--archive-only", action="store_true")
 
     args = parser.parse_args()
 
@@ -90,6 +91,7 @@ def main():
             args.date,
             args.sleep,
             args.refresh_calendar,
+            args.archive_only,
         )
 
 
