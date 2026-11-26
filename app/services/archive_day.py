@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +18,19 @@ from .cratedb import (
 
 
 def _none(value: Any) -> Any:
-    return None if pd.isna(value) else value
+    if pd.isna(value):
+        return None
+
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    if hasattr(value, "item"):
+        return value.item()
+
+    return value
 
 
 def _sector_path(day: date) -> Path:
