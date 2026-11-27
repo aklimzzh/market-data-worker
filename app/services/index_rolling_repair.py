@@ -1,16 +1,12 @@
 from __future__ import annotations
-
-import csv
 import threading
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
-
 import pandas as pd
-
 from ..config import DATA_DIR
 from ..index_minute_backfill import fetch_sina, normalise, record
 from ..sources.index_realtime import CONFIG
-from .index_minute import FIELDS, upload_batch
+from .index_minute import upload_batch
 from .local_store import write_json_atomic
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -20,20 +16,6 @@ _RUNNING = False
 
 def _status_path(day):
     return DATA_DIR / "status" / f"index_rolling_repair_{day.isoformat()}.json"
-
-
-def _append(records):
-    if not records:
-        return
-    day = datetime.fromisoformat(records[0]["minute_ts"]).astimezone(TZ).date()
-    target = DATA_DIR / "index_raw" / day.strftime("%Y/%m") / f"{day}.csv"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    new = not target.exists()
-    with target.open("a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=FIELDS)
-        if new:
-            writer.writeheader()
-        writer.writerows(records)
 
 
 def repair_now(now: datetime, minutes: int | None = 30, mode: str = "rolling", morning_only: bool = False):
@@ -66,7 +48,10 @@ def repair_now(now: datetime, minutes: int | None = 30, mode: str = "rolling", m
         batch = records[offset:offset + 400]
         result = upload_batch(batch)
         uploaded += int(result.get("upserted", len(batch)))
-    _append(records)
+    # IMPORTANT: repair data is historical-minute data and must not be appended
+    # to the realtime CSV. The realtime collector derives minute values from
+    # cumulative realtime snapshots, so mixing the two sources corrupts its
+    # next diff baseline and can create artificial spikes.
     output = {
         "state": "SUCCESS" if not failures else "PARTIAL", "mode": mode,
         "trade_date": day.isoformat(), "minutes": minutes, "morning_only": morning_only,
